@@ -215,6 +215,88 @@ scan_running_claude_sessions() { # 每行 "name<TAB>tty"
   done < <(ps_claude_lines)
 }
 
+# ---------- 8. iTerm2 AppleScript ----------
+run_osascript() { # <script> [args...] — 设 OS_OUT/OS_ERR/OS_RC
+  local script="$1"; shift
+  local errtmp; errtmp=$(mktemp)
+  OS_OUT=$(/usr/bin/osascript -e "$script" "$@" 2>"$errtmp"); OS_RC=$?
+  OS_ERR=$(<"$errtmp"); rm -f "$errtmp"
+  return 0
+}
+
+iterm_read_contents() { # <devtty> — rc 0 ok(REPLY_CONTENTS) / 1 notfound / 2 error
+  local script='
+on run {ttyPath}
+  tell application "iTerm2"
+    repeat with w in windows
+      repeat with t in tabs of w
+        repeat with s in sessions of t
+          if (tty of s as text) is ttyPath then
+            return contents of s
+          end if
+        end repeat
+      end repeat
+    end repeat
+  end tell
+  return "KEEPALIVE_NOTFOUND"
+end run'
+  run_osascript "$script" "$1"
+  (( OS_RC != 0 )) && return 2
+  [[ "$OS_OUT" == "KEEPALIVE_NOTFOUND" ]] && return 1
+  REPLY_CONTENTS="$OS_OUT"
+  return 0
+}
+
+iterm_write_text() { # <devtty> <message> — rc 0 ok / 1 notfound / 2 error
+  local script='
+on run {ttyPath, msg}
+  tell application "iTerm2"
+    repeat with w in windows
+      repeat with t in tabs of w
+        repeat with s in sessions of t
+          if (tty of s as text) is ttyPath then
+            tell s to write text msg
+            return "OK"
+          end if
+        end repeat
+      end repeat
+    end repeat
+  end tell
+  return "KEEPALIVE_NOTFOUND"
+end run'
+  run_osascript "$script" "$1" "$2"
+  (( OS_RC != 0 )) && return 2
+  [[ "$OS_OUT" == "KEEPALIVE_NOTFOUND" ]] && return 1
+  return 0
+}
+
+iterm_scan_tty_by_name() { # <session_name> — rc 0 设 SCAN_COUNT/SCAN_LIST / rc 2 error
+  local script='
+on run {sessName}
+  tell application "iTerm2"
+    set output to ""
+    set n to 0
+    repeat with w in windows
+      repeat with t in tabs of w
+        repeat with s in sessions of t
+          if (contents of s) contains sessName then
+            set n to n + 1
+            set output to output & (tty of s as text) & linefeed
+          end if
+        end repeat
+      end repeat
+    end repeat
+    if n is 0 then return "0"
+    return (n as text) & linefeed & output
+  end tell
+end run'
+  run_osascript "$script" "$1"
+  (( OS_RC != 0 )) && return 2
+  SCAN_COUNT=$(printf '%s\n' "$OS_OUT" | head -n 1)
+  SCAN_LIST=$(printf '%s\n' "$OS_OUT" | tail -n +2)
+  return 0
+}
+
 # ---------- 14. 入口 ----------
 if [[ "${KEEPALIVE_TEST_MODE:-}" != "1" && "${BASH_SOURCE[0]}" == "$0" ]]; then
   main "$@"
