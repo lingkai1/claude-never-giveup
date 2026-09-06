@@ -297,6 +297,97 @@ end run'
   return 0
 }
 
+# ---------- 9. 单监控检查管线 ----------
+touch_state() { # <name> <state> — 非运行态记录并落盘
+  ST_LAST_STATE="$2"; ST_LAST_CHECK=$(now)
+  write_state "$1"
+  log INFO "$1" "state=$2"
+}
+
+do_inject() { # <name> <devtty> <message>（依赖 M_DRY_RUN）
+  if (( M_DRY_RUN == 1 )); then
+    log INFO "$1" "[dry-run] 本应注入「$3」"
+    ST_AWAITING=1; ST_LAST_INJECT=$(now)
+    return 0
+  fi
+  if iterm_write_text "$2" "$3"; then
+    ST_AWAITING=1; ST_LAST_INJECT=$(now)
+    log INFO "$1" "已注入「$3」"
+  else
+    log ERROR "$1" "注入失败: $OS_ERR"
+  fi
+  return 0
+}
+
+check_monitor() { # <name>
+  local name="$1"
+  local conf="$MON_DIR/$name.conf"
+  load_monitor_conf "$conf" || { log ERROR "$name" "conf 无效，跳过"; return 0; }
+  (( M_ENABLED == 1 )) || return 0
+  read_state "$name"
+
+  local devtty rc contents state decision
+  devtty=$(find_claude_tty_for_session "$M_SESSION_NAME"); rc=$?
+  if (( rc == 1 )); then touch_state "$name" "NO_SESSION";   return 0; fi
+  if (( rc == 2 )); then
+    log ERROR "$name" "多个进程匹配 session_name=$M_SESSION_NAME，跳过"
+    touch_state "$name" "AMBIGUOUS"; return 0
+  fi
+
+  if ! iterm_read_contents "$devtty"; then
+    rc=$?
+    if (( rc == 2 )); then
+      log ERROR "$name" "osascript 失败: $OS_ERR"
+      case "$OS_ERR" in
+        *-1743*|*"not authorized"*|*"Not authorized"*)
+          log ERROR "$name" "需授权：系统设置 → 隐私与安全性 → 自动化 → 允许控制 iTerm2" ;;
+      esac
+      touch_state "$name" "NO_ITERM"; return 0
+    fi
+    # tty 匹配不到 session → 按会话名扫内容（覆盖 /rename 情况）
+    if ! iterm_scan_tty_by_name "$M_SESSION_NAME"; then
+      touch_state "$name" "NO_ITERM"; return 0
+    fi
+    if   (( SCAN_COUNT == 0 )); then touch_state "$name" "NO_SESSION"; return 0
+    elif (( SCAN_COUNT > 1 ));  then
+      log ERROR "$name" "按会话名扫描命中 $SCAN_COUNT 个 iTerm2 session，跳过"
+      touch_state "$name" "AMBIGUOUS"; return 0
+    fi
+    devtty=$(printf '%s\n' "$SCAN_LIST" | head -n 1)
+    devtty="/dev/${devtty#/dev/}"
+    iterm_read_contents "$devtty" || { touch_state "$name" "SESSION_NOT_FOUND"; return 0; }
+  fi
+  contents="$REPLY_CONTENTS"
+
+  state=$(classify_tail "$contents")
+  ST_LAST_CHECK=$(now); ST_LAST_STATE="$state"
+
+  if [[ "$state" == "BUSY" ]]; then
+    ST_AWAITING=0; ST_CONSEC_FAIL=0
+    log INFO "$name" "state=BUSY（注入已生效，计数清零）"
+  elif [[ "$state" == "IDLE" ]]; then
+    decision=$(decide_action "$ST_AWAITING" "$ST_CONSEC_FAIL" "$contents" "$M_MESSAGE")
+    case "$decision" in
+      INJECT_FIRST|INJECT_AGAIN)
+        [[ "$decision" == "INJECT_AGAIN" ]] && ST_CONSEC_FAIL=0
+        do_inject "$name" "$devtty" "$M_MESSAGE" ;;
+      INJECT_RETRY)
+        ST_CONSEC_FAIL=$((ST_CONSEC_FAIL + 1))
+        log WARN "$name" "上次注入未见生效（第 $ST_CONSEC_FAIL/$BREAKER_LIMIT 次）"
+        do_inject "$name" "$devtty" "$M_MESSAGE" ;;
+      TRIP)
+        ST_CONSEC_FAIL=$((ST_CONSEC_FAIL + 1))
+        log ERROR "$name" "连续 $ST_CONSEC_FAIL 次注入未生效，熔断：自动禁用该监控"
+        M_ENABLED=0
+        write_monitor_conf "$conf" "$M_SESSION_NAME" "$M_MESSAGE" "$M_INTERVAL" 0 "$M_DRY_RUN" ;;
+    esac
+  else
+    log INFO "$name" "state=$state，不打扰"
+  fi
+  write_state "$name"
+  return 0
+}
+
 # ---------- 14. 入口 ----------
 if [[ "${KEEPALIVE_TEST_MODE:-}" != "1" && "${BASH_SOURCE[0]}" == "$0" ]]; then
   main "$@"

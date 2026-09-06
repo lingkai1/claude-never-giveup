@@ -115,6 +115,62 @@ eq "名字提取 --resume" "$(extract_session_name_from_args 'claude --resume pp
 eq "名字提取 无"       "$(extract_session_name_from_args 'claude -p hi')" ""
 scan_running_claude_sessions | grep -q "keepalive" && bad "扫描不包含自身" || ok "扫描不包含自身"
 
+# ===== Task6: 检查管线（stub 外部依赖） =====
+iterm_read_contents()   { REPLY_CONTENTS="$STUB_CONTENTS"; return 0; }
+iterm_write_text()      { STUB_WROTE="$2"; return 0; }
+iterm_scan_tty_by_name() { SCAN_COUNT=0; SCAN_LIST=""; return 0; }
+find_claude_tty_for_session() { echo "$STUB_TTY"; return 0; }
+
+mkdir -p "$MON_DIR" "$STATE_DIR"
+CN6="$MON_DIR/pipe1.conf"
+write_monitor_conf "$CN6" pipe1 "继续" 60 1 0
+STUB_TTY="/dev/ttys999"
+STUB_CONTENTS='> 继续
+完成
+❯'
+STUB_WROTE=""
+check_monitor pipe1
+eq "idle 注入消息" "$STUB_WROTE" "继续"
+read_state pipe1
+eq "注入后 awaiting=1" "$ST_AWAITING" "1"
+eq "状态记 IDLE" "$ST_LAST_STATE" "IDLE"
+
+STUB_CONTENTS='> 继续
+❯'
+check_monitor pipe1
+read_state pipe1
+eq "落地后 fail 清零" "$ST_CONSEC_FAIL" "0"
+
+STUB_CONTENTS='无关内容
+❯'
+check_monitor pipe1; read_state pipe1
+eq "未落地 fail=1" "$ST_CONSEC_FAIL" "1"
+check_monitor pipe1; read_state pipe1
+eq "未落地 fail=2" "$ST_CONSEC_FAIL" "2"
+check_monitor pipe1; read_state pipe1
+eq "第三次触发熔断 fail=3" "$ST_CONSEC_FAIL" "3"
+load_monitor_conf "$CN6"
+eq "熔断写回 enabled=0" "$M_ENABLED" "0"
+eq "熔断那次不注入" "$STUB_WROTE" "继续"
+
+# 熔断已禁用监控 → 重新启用后验证 BUSY 路径（计划审查修正点）
+write_monitor_conf "$CN6" pipe1 "继续" 60 1 0
+STUB_CONTENTS='⠸ Working (esc to interrupt)
+'
+check_monitor pipe1; read_state pipe1
+eq "busy 状态记录" "$ST_LAST_STATE" "BUSY"
+eq "busy 清零 awaiting" "$ST_AWAITING" "0"
+
+# 禁用的监控直接跳过
+write_monitor_conf "$CN6" pipe1 "继续" 60 0 0
+STUB_CONTENTS='❯'
+STUB_WROTE=""
+check_monitor pipe1
+eq "disabled 不注入" "$STUB_WROTE" ""
+
+# 恢复 stub（后续 task 不受影响）
+unset -f iterm_read_contents iterm_write_text iterm_scan_tty_by_name find_claude_tty_for_session
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 rm -rf "$KEEPALIVE_BASE_DIR"
