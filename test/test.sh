@@ -171,6 +171,17 @@ eq "disabled 不注入" "$STUB_WROTE" ""
 # 恢复 stub（后续 task 不受影响）
 unset -f iterm_read_contents iterm_write_text iterm_scan_tty_by_name find_claude_tty_for_session
 
+# ===== Task7: 入口与状态表 =====
+mkdir -p "$MON_DIR" "$STATE_DIR"
+write_monitor_conf "$MON_DIR/s7.conf" s7 "继续" 60 1 0
+state_default; ST_LAST_STATE=IDLE; ST_LAST_CHECK=$(now); write_state s7
+cmd_status | grep -q 's7' && ok "status 表含监控" || bad "status 表含监控"
+cmd_status | grep -q 'daemon: stopped' && ok "status 显示 daemon 状态" || bad "status 显示 daemon 状态"
+daemon_pid | grep -q . && bad "无 daemon 时不返回 pid" || ok "无 daemon 时不返回 pid"
+echo '999999999' > "$PID_FILE"
+daemon_pid | grep -q . && bad "死 pid 不算运行" || ok "死 pid 不算运行"
+rm -f "$PID_FILE"
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 rm -rf "$KEEPALIVE_BASE_DIR"

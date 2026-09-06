@@ -388,6 +388,155 @@ check_monitor() { # <name>
   return 0
 }
 
+# ---------- 10. daemon ----------
+daemon_pid() {
+  local p; p=$(cat "$PID_FILE" 2>/dev/null)
+  [[ -n "$p" ]] && kill -0 "$p" 2>/dev/null && echo "$p"
+  return 0
+}
+
+daemon_exit() { rm -f "$PID_FILE"; log INFO daemon "退出"; exit 0; }
+
+daemon_run() {
+  ensure_dirs
+  load_global_conf
+  if [[ -e "$STOP_FILE" ]]; then log INFO daemon "启动时存在 stop 文件，退出"; exit 0; fi
+  if ( set -o noclobber; echo "$$" > "$PID_FILE" ) 2>/dev/null; then
+    :
+  else
+    local old; old=$(cat "$PID_FILE" 2>/dev/null)
+    if [[ -n "$old" ]] && kill -0 "$old" 2>/dev/null; then
+      log ERROR daemon "已有实例 pid=$old，退出"; exit 1
+    fi
+    echo "$$" > "$PID_FILE"
+  fi
+  trap daemon_exit INT TERM
+  trap 'rm -f "$PID_FILE"' EXIT
+  log INFO daemon "启动（pid $$，tick=${TICK_SECONDS}s）"
+  local conf name
+  while :; do
+    [[ -e "$STOP_FILE" ]] && { log INFO daemon "检测到 stop 文件，退出"; exit 0; }
+    for conf in "$MON_DIR"/*.conf; do
+      [[ -e "$conf" ]] || continue
+      name="${conf##*/}"; name="${name%.conf}"
+      if load_monitor_conf "$conf"; then
+        if (( M_ENABLED == 1 )); then
+          read_state "$name"
+          if (( $(now) - ST_LAST_CHECK >= M_INTERVAL )); then
+            check_monitor "$name" || log ERROR "$name" "检查异常"
+          fi
+        fi
+      else
+        log ERROR "$name" "conf 无效：$conf"
+      fi
+    done
+    sleep "$TICK_SECONDS"
+  done
+}
+
+# ---------- 11. 命令 ----------
+cmd_start() {
+  ensure_dirs
+  rm -f "$STOP_FILE"
+  local p; p=$(daemon_pid)
+  if [[ -n "$p" ]]; then echo "daemon 已在运行 (pid $p)"; return 0; fi
+  if launchd_loaded; then
+    launchctl kickstart -k "gui/$(id -u)/$LAUNCHD_LABEL" && echo "已通过 launchd 拉起"
+  else
+    nohup /bin/bash "$SCRIPT_PATH" daemon >>"$DAEMON_OUT" 2>&1 &
+    echo "daemon 已后台启动 (pid $!)"
+  fi
+  return 0
+}
+
+cmd_stop() {
+  ensure_dirs
+  touch "$STOP_FILE"
+  local p; p=$(daemon_pid)
+  if [[ -n "$p" ]]; then
+    kill "$p" 2>/dev/null
+    echo "已通知 daemon (pid $p) 退出"
+  else
+    echo "daemon 未在运行（stop 文件已放置）"
+  fi
+  return 0
+}
+
+cmd_status() {
+  ensure_dirs
+  printf '%-18s %-8s %-15s %-20s %-20s %s\n' NAME ENABLED STATE LAST_CHECK LAST_INJECT FAILS
+  local conf name lc li
+  for conf in "$MON_DIR"/*.conf; do
+    [[ -e "$conf" ]] || continue
+    name="${conf##*/}"; name="${name%.conf}"
+    if ! load_monitor_conf "$conf"; then
+      printf '%-18s %-8s %s\n' "$name" "-" "CONF_INVALID"; continue
+    fi
+    read_state "$name"
+    if (( ST_LAST_CHECK  > 0 )); then lc=$(date -r "$ST_LAST_CHECK"  '+%m-%d %H:%M:%S'); else lc="-"; fi
+    if (( ST_LAST_INJECT > 0 )); then li=$(date -r "$ST_LAST_INJECT" '+%m-%d %H:%M:%S'); else li="-"; fi
+    printf '%-18s %-8s %-15s %-20s %-20s %s\n' \
+      "$M_SESSION_NAME" "$M_ENABLED" "$ST_LAST_STATE" "$lc" "$li" "$ST_CONSEC_FAIL"
+  done
+  local p; p=$(daemon_pid)
+  if [[ -n "$p" ]]; then echo "daemon: running (pid $p)"; else echo "daemon: stopped"; fi
+  return 0
+}
+
+cmd_once() {
+  load_global_conf
+  if [[ -n $(daemon_pid) ]]; then
+    echo "警告：daemon 正在运行，状态文件并发写入（原子写，风险低）"
+  fi
+  local conf name any=0
+  for conf in "$MON_DIR"/*.conf; do
+    [[ -e "$conf" ]] || continue
+    any=1; name="${conf##*/}"; name="${name%.conf}"
+    if ! load_monitor_conf "$conf"; then echo "[skip] $name: conf 无效"; continue; fi
+    (( M_ENABLED == 1 )) || { echo "[skip] $name: disabled"; continue; }
+    echo "== 检查 $name（session=${M_SESSION_NAME}）"
+    check_monitor "$name"
+  done
+  (( any == 0 )) && echo "没有监控配置：$MON_DIR 下放 .conf，或运行 setup"
+  return 0
+}
+
+# ---------- 13. usage 与入口 ----------
+usage() {
+  cat <<EOF
+claude-keepalive v$VERSION — 让指定名字的 Claude Code 会话（iTerm2）持续工作
+
+用法: claude-keepalive.sh <命令>
+  setup        TUI：添加/编辑监控、启停 daemon、看日志
+  start        启动 daemon（清除 stop 文件）
+  stop         停止 daemon（放置 stop 文件）
+  status       非交互状态表
+  once         立即检查一轮全部监控（调试）
+  daemon       前台运行 daemon（launchd / 调试用）
+  install      安装 launchd 常驻
+  uninstall    卸载 launchd
+
+配置目录: $BASE_DIR
+全局刹车: touch $STOP_FILE   （start 会清除）
+EOF
+}
+
+main() {
+  load_global_conf
+  case "${1:-help}" in
+    setup)      tui_main ;;
+    start)      cmd_start ;;
+    stop)       cmd_stop ;;
+    status)     cmd_status ;;
+    once)       cmd_once ;;
+    daemon)     daemon_run ;;
+    install)    cmd_install ;;
+    uninstall)  cmd_uninstall ;;
+    help|-h|--help) usage ;;
+    *) usage; exit 1 ;;
+  esac
+}
+
 # ---------- 14. 入口 ----------
 if [[ "${KEEPALIVE_TEST_MODE:-}" != "1" && "${BASH_SOURCE[0]}" == "$0" ]]; then
   main "$@"
