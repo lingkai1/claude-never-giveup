@@ -99,6 +99,22 @@ CT_NO='别的输出
 eq "未落地重试"   "$(decide_action 1 0 "$CT_NO" "继续")" "INJECT_RETRY"
 eq "未落地达上限" "$(decide_action 1 2 "$CT_NO" "继续")" "TRIP"
 
+# ===== Task4: ps 解析 =====
+eq "tty 提取"  "$(ps_tty_of_line '12345 ttys012 claude -n worker')" "ttys012"
+eq "args 提取" "$(ps_args_of_line '12345 ttys012 node /x/cli.js -n worker')" "node /x/cli.js -n worker"
+eq "-n 取 tty" "$(match_ps_line_for_session '12345 ttys012 claude -n worker' worker)" "ttys012"
+eq "--resume 取 tty" "$(match_ps_line_for_session '12345 ttys012 claude --resume ppt' ppt)" "ttys012"
+eq "--name= 取 tty" "$(match_ps_line_for_session '12345 ttys012 claude --name=ppt' ppt)" "ttys012"
+match_ps_line_for_session '12345 ?? claude -n worker' worker >/dev/null && bad "无tty不匹配" || ok "无tty不匹配"
+match_ps_line_for_session '12345 ttys012 claude -n other' worker >/dev/null && bad "名字不同不匹配" || ok "名字不同不匹配"
+match_ps_line_for_session '12345 ttys012 tail -n worker.log claude' worker >/dev/null && bad "tail -n 误匹配" || ok "tail -n 不误匹配"
+match_ps_line_for_session '12345 ttys012 claude -n worker extra' worker >/dev/null && ok "名字后有参数仍匹配" || bad "名字后有参数仍匹配"
+eq "名字提取 -n"       "$(extract_session_name_from_args 'claude -n worker')" "worker"
+eq "名字提取 --name="  "$(extract_session_name_from_args 'claude --name=ppt')" "ppt"
+eq "名字提取 --resume" "$(extract_session_name_from_args 'claude --resume ppt')" "ppt"
+eq "名字提取 无"       "$(extract_session_name_from_args 'claude -p hi')" ""
+scan_running_claude_sessions | grep -q "keepalive" && bad "扫描不包含自身" || ok "扫描不包含自身"
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 rm -rf "$KEEPALIVE_BASE_DIR"

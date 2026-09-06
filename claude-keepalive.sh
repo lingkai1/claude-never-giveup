@@ -161,6 +161,60 @@ decide_action() { # <awaiting> <consec_fail> <content> <message>
   return 0
 }
 
+# ---------- 7. ps 解析与定位 ----------
+ps_claude_lines() {
+  ps ax -o pid=,tty=,args= | grep -i 'claude' | grep -vE 'keepalive|grep' || true
+}
+
+ps_tty_of_line()  { printf '%s\n' "$1" | awk '{print $2}'; }
+ps_args_of_line() { printf '%s\n' "$1" | awk '{ $1=""; $2=""; sub(/^ +/, ""); print }'; }
+
+match_ps_line_for_session() { # <ps_line> <session_name> — rc 0 且 echo tty
+  local line="$1" name="$2" tty args
+  tty=$(ps_tty_of_line "$line")
+  [[ -z "$tty" || "$tty" == "?" || "$tty" == "??" ]] && return 1
+  args=$(ps_args_of_line "$line")
+  case " $args " in
+    *" -n $name "*|*" --name $name "*|*" --name=$name "*|*" --resume $name "*|*" -r $name "*)
+      echo "$tty"; return 0 ;;
+  esac
+  return 1
+}
+
+extract_session_name_from_args() { # <args>
+  printf '%s\n' "$1" | awk '{
+    for (i = 1; i <= NF; i++) {
+      if ($i == "-n" || $i == "--name" || $i == "--resume" || $i == "-r") { print $(i+1); exit }
+      if ($i ~ /^--name=/) { sub(/^--name=/, "", $i); print $i; exit }
+    }
+  }'
+}
+
+find_claude_tty_for_session() { # <session_name> — rc0 echo /dev/ttysN | rc1 无 | rc2 歧义
+  local name="$1" line tty found="" count=0
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    if tty=$(match_ps_line_for_session "$line" "$name"); then
+      count=$((count + 1)); found="$tty"
+    fi
+  done < <(ps_claude_lines)
+  (( count == 1 )) && { echo "/dev/$found"; return 0; }
+  (( count > 1 ))  && return 2
+  return 1
+}
+
+scan_running_claude_sessions() { # 每行 "name<TAB>tty"
+  local line args nm tty
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    tty=$(ps_tty_of_line "$line")
+    [[ -z "$tty" || "$tty" == "?" || "$tty" == "??" ]] && continue
+    args=$(ps_args_of_line "$line")
+    nm=$(extract_session_name_from_args "$args")
+    [[ -n "$nm" ]] && valid_session_name "$nm" && printf '%s\t%s\n' "$nm" "$tty"
+  done < <(ps_claude_lines)
+}
+
 # ---------- 14. 入口 ----------
 if [[ "${KEEPALIVE_TEST_MODE:-}" != "1" && "${BASH_SOURCE[0]}" == "$0" ]]; then
   main "$@"
