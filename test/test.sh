@@ -49,6 +49,56 @@ state_default
 read_state testmon
 eq "state 往返" "$ST_LAST_STATE/$ST_LAST_CHECK/$ST_CONSEC_FAIL" "IDLE/123/2"
 
+# ===== Task3: 分类与决策 =====
+FIX_IDLE='
+> 继续
+  已完成第一部分
+✻ 一些输出
+❯
+⏵⏵ accept edits on · claude-opus-5 · ~/proj  ? for shortcuts'
+eq "idle: 空输入框+footer" "$(classify_tail "$FIX_IDLE")" "IDLE"
+FIX_IDLE2='
+结果如下
+❯'
+eq "idle: ❯ 为最后一行" "$(classify_tail "$FIX_IDLE2")" "IDLE"
+FIX_BUSY='
+> 继续
+⠸ Generating… (esc to interrupt)
+'
+eq "busy: esc to interrupt" "$(classify_tail "$FIX_BUSY")" "BUSY"
+FIX_DIALOG='
+  ⎿ Updated 3 files
+Do you want to proceed?
+❯ 1. Yes
+  2. Yes, and auto-accept edits
+  3. No, and tell Claude what to do differently (esc)
+'
+eq "dialog: 权限菜单" "$(classify_tail "$FIX_DIALOG")" "DIALOG"
+FIX_DRAFT='
+❯ 请继续修改测试
+⏵⏵ accept edits on'
+eq "draft: 有草稿不算 IDLE" "$(classify_tail "$FIX_DRAFT")" "UNKNOWN"
+FIX_UNKNOWN='
+hello world
+plain text
+'
+eq "unknown: 无特征" "$(classify_tail "$FIX_UNKNOWN")" "UNKNOWN"
+FIX_MIX='
+❯ 1. Yes
+⠹ Working (esc to interrupt)
+'
+eq "busy 优先于 dialog" "$(classify_tail "$FIX_MIX")" "BUSY"
+FIX_ANSI="$(printf '\033[32m❯\033[0m\n')"
+eq "idle: ANSI 包裹的 ❯" "$(classify_tail "$FIX_ANSI")" "IDLE"
+CT='> 继续
+❯'
+eq "首次注入"     "$(decide_action 0 0 "$CT" "继续")"   "INJECT_FIRST"
+eq "落地后再注入" "$(decide_action 1 0 "$CT" "继续")"   "INJECT_AGAIN"
+CT_NO='别的输出
+❯'
+eq "未落地重试"   "$(decide_action 1 0 "$CT_NO" "继续")" "INJECT_RETRY"
+eq "未落地达上限" "$(decide_action 1 2 "$CT_NO" "继续")" "TRIP"
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 rm -rf "$KEEPALIVE_BASE_DIR"

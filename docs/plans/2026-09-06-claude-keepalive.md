@@ -365,10 +365,10 @@ classify_tail() { # <contents text> — echo BUSY|DIALOG|IDLE|UNKNOWN
   tail40=$(printf '%s\n' "$text" | strip_ansi | tail -n 40)
   tail12=$(printf '%s\n' "$tail40" | tail -n 12)
   tail8=$(printf '%s\n'  "$tail12" | tail -n 8)
-  for p in ${BUSY_PATTERNS[@+"${BUSY_PATTERNS[@]}"}; do
+  for p in ${BUSY_PATTERNS[@]+"${BUSY_PATTERNS[@]}"}; do
     printf '%s\n' "$tail8" | grep -qE -- "$p" && { echo BUSY; return 0; }
   done
-  for p in ${DIALOG_PATTERNS[@+"${DIALOG_PATTERNS[@]}"}; do
+  for p in ${DIALOG_PATTERNS[@]+"${DIALOG_PATTERNS[@]}"}; do
     printf '%s\n' "$tail12" | grep -qE -- "$p" && { echo DIALOG; return 0; }
   done
   nonempty=$(printf '%s\n' "$tail12" | grep -v '^[[:space:]]*$')

@@ -125,6 +125,42 @@ ST_AWAITING=$ST_AWAITING
 ST_CONSEC_FAIL=$ST_CONSEC_FAIL"
 }
 
+# ---------- 6. 状态分类与注入决策（纯函数） ----------
+classify_tail() { # <contents text> — echo BUSY|DIALOG|IDLE|UNKNOWN
+  local text="$1"
+  local tail40 tail12 tail8 p line nonempty last6
+  tail40=$(printf '%s\n' "$text" | strip_ansi | tail -n 40)
+  tail12=$(printf '%s\n' "$tail40" | tail -n 12)
+  tail8=$(printf '%s\n'  "$tail12" | tail -n 8)
+  for p in ${BUSY_PATTERNS[@]+"${BUSY_PATTERNS[@]}"}; do
+    printf '%s\n' "$tail8" | grep -qE -- "$p" && { echo BUSY; return 0; }
+  done
+  for p in ${DIALOG_PATTERNS[@]+"${DIALOG_PATTERNS[@]}"}; do
+    printf '%s\n' "$tail12" | grep -qE -- "$p" && { echo DIALOG; return 0; }
+  done
+  nonempty=$(printf '%s\n' "$tail12" | grep -v '^[[:space:]]*$')
+  last6=$(printf '%s\n' "$nonempty" | tail -n 6)
+  while IFS= read -r line; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ "$line" == "❯" ]] && { echo IDLE; return 0; }
+  done <<< "$last6"
+  echo UNKNOWN
+  return 0
+}
+
+# 只在 classify_tail == IDLE 时调用
+decide_action() { # <awaiting> <consec_fail> <content> <message>
+  local awaiting="$1" consec="$2" content="$3" message="$4"
+  if (( awaiting == 0 )); then echo INJECT_FIRST; return 0; fi
+  if printf '%s\n' "$content" | strip_ansi | tail -n 100 | grep -qF -- "> $message"; then
+    echo INJECT_AGAIN; return 0
+  fi
+  if (( consec + 1 >= BREAKER_LIMIT )); then echo TRIP; return 0; fi
+  echo INJECT_RETRY
+  return 0
+}
+
 # ---------- 14. 入口 ----------
 if [[ "${KEEPALIVE_TEST_MODE:-}" != "1" && "${BASH_SOURCE[0]}" == "$0" ]]; then
   main "$@"
