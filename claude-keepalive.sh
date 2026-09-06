@@ -271,6 +271,7 @@ end run'
 }
 
 iterm_scan_tty_by_name() { # <session_name> — rc 0 设 SCAN_COUNT/SCAN_LIST / rc 2 error
+  # 匹配 iTerm2 session 标题（Claude Code 会把会话名写进终端标题，/rename 后同步更新）
   local script='
 on run {sessName}
   tell application "iTerm2"
@@ -279,7 +280,7 @@ on run {sessName}
     repeat with w in windows
       repeat with t in tabs of w
         repeat with s in sessions of t
-          if (contents of s) contains sessName then
+          if (name of s) contains sessName then
             set n to n + 1
             set output to output & (tty of s as text) & linefeed
           end if
@@ -328,23 +329,12 @@ check_monitor() { # <name>
 
   local devtty rc contents state decision
   devtty=$(find_claude_tty_for_session "$M_SESSION_NAME"); rc=$?
-  if (( rc == 1 )); then touch_state "$name" "NO_SESSION";   return 0; fi
   if (( rc == 2 )); then
-    log ERROR "$name" "多个进程匹配 session_name=$M_SESSION_NAME，跳过"
+    log ERROR "$name" "多个进程匹配 session_name=${M_SESSION_NAME}，跳过"
     touch_state "$name" "AMBIGUOUS"; return 0
   fi
-
-  if ! iterm_read_contents "$devtty"; then
-    rc=$?
-    if (( rc == 2 )); then
-      log ERROR "$name" "osascript 失败: $OS_ERR"
-      case "$OS_ERR" in
-        *-1743*|*"not authorized"*|*"Not authorized"*)
-          log ERROR "$name" "需授权：系统设置 → 隐私与安全性 → 自动化 → 允许控制 iTerm2" ;;
-      esac
-      touch_state "$name" "NO_ITERM"; return 0
-    fi
-    # tty 匹配不到 session → 按会话名扫内容（覆盖 /rename 情况）
+  if (( rc == 1 )); then
+    # ps 无匹配（未用 -n 启动等）→ 按 iTerm2 会话标题兜底定位
     if ! iterm_scan_tty_by_name "$M_SESSION_NAME"; then
       touch_state "$name" "NO_ITERM"; return 0
     fi
@@ -355,9 +345,38 @@ check_monitor() { # <name>
     fi
     devtty=$(printf '%s\n' "$SCAN_LIST" | head -n 1)
     devtty="/dev/${devtty#/dev/}"
-    iterm_read_contents "$devtty" || { touch_state "$name" "SESSION_NOT_FOUND"; return 0; }
+    if ! iterm_read_contents "$devtty"; then
+      touch_state "$name" "SESSION_NOT_FOUND"; return 0
+    fi
+    contents="$REPLY_CONTENTS"
+  else
+    if ! iterm_read_contents "$devtty"; then
+      rc=$?
+      if (( rc == 2 )); then
+        log ERROR "$name" "osascript 失败: $OS_ERR"
+        case "$OS_ERR" in
+          *-1743*|*"not authorized"*|*"Not authorized"*)
+            log ERROR "$name" "需授权：系统设置 → 隐私与安全性 → 自动化 → 允许控制 iTerm2" ;;
+        esac
+        touch_state "$name" "NO_ITERM"; return 0
+      fi
+      # ps 找到进程但 tty 匹配不到 iTerm2 session（别的终端 App 或已退出）
+      if ! iterm_scan_tty_by_name "$M_SESSION_NAME"; then
+        touch_state "$name" "NO_ITERM"; return 0
+      fi
+      if   (( SCAN_COUNT == 0 )); then touch_state "$name" "NO_SESSION"; return 0
+      elif (( SCAN_COUNT > 1 ));  then
+        log ERROR "$name" "按会话名扫描命中 $SCAN_COUNT 个 iTerm2 session，跳过"
+        touch_state "$name" "AMBIGUOUS"; return 0
+      fi
+      devtty=$(printf '%s\n' "$SCAN_LIST" | head -n 1)
+      devtty="/dev/${devtty#/dev/}"
+      if ! iterm_read_contents "$devtty"; then
+        touch_state "$name" "SESSION_NOT_FOUND"; return 0
+      fi
+    fi
+    contents="$REPLY_CONTENTS"
   fi
-  contents="$REPLY_CONTENTS"
 
   state=$(classify_tail "$contents")
   ST_LAST_CHECK=$(now); ST_LAST_STATE="$state"
@@ -382,7 +401,7 @@ check_monitor() { # <name>
         write_monitor_conf "$conf" "$M_SESSION_NAME" "$M_MESSAGE" "$M_INTERVAL" 0 "$M_DRY_RUN" ;;
     esac
   else
-    log INFO "$name" "state=$state，不打扰"
+    log INFO "$name" "state=${state}，不打扰"
   fi
   write_state "$name"
   return 0
@@ -406,7 +425,7 @@ daemon_run() {
   else
     local old; old=$(cat "$PID_FILE" 2>/dev/null)
     if [[ -n "$old" ]] && kill -0 "$old" 2>/dev/null; then
-      log ERROR daemon "已有实例 pid=$old，退出"; exit 1
+      log ERROR daemon "已有实例 pid=${old}，退出"; exit 1
     fi
     echo "$$" > "$PID_FILE"
   fi
@@ -500,7 +519,7 @@ cmd_once() {
     any=1; name="${conf##*/}"; name="${name%.conf}"
     if ! load_monitor_conf "$conf"; then echo "[skip] $name: conf 无效"; continue; fi
     (( M_ENABLED == 1 )) || { echo "[skip] $name: disabled"; continue; }
-    echo "== 检查 $name（session=${M_SESSION_NAME}）"
+    echo "== 检查 ${name}（session=${M_SESSION_NAME}）"
     check_monitor "$name"
   done
   (( any == 0 )) && echo "没有监控配置：$MON_DIR 下放 .conf，或运行 setup"
@@ -553,6 +572,162 @@ cmd_uninstall() {
   launchctl unload -w "$LAUNCHD_PLIST" 2>/dev/null
   rm -f "$LAUNCHD_PLIST"
   echo "已卸载 LaunchAgent"
+  return 0
+}
+
+# ---------- 12.5 TUI ----------
+tui_bold() { printf '\033[1m%s\033[0m\n' "$*"; }
+
+tui_ask() { # <var> <default> <prompt> — 回车保留默认
+  local __var="$1" __def="$2" __p="$3" __ans
+  read -r -p "$__p [$__def]: " __ans
+  [[ -z "$__ans" ]] && __ans="$__def"
+  printf -v "$__var" '%s' "$__ans"
+}
+
+tui_pick_monitor() { # echo 选中 name；rc 1 取消
+  local conf name i=1
+  local arr=()
+  for conf in "$MON_DIR"/*.conf; do
+    [[ -e "$conf" ]] || continue
+    name="${conf##*/}"; name="${name%.conf}"
+    printf '  %d) %s\n' "$i" "$name"
+    arr[$i]="$name"; i=$((i+1))
+  done
+  if [[ ${#arr[@]} -eq 0 ]]; then echo "（暂无监控配置）" >&2; return 1; fi
+  local pick
+  tui_ask pick 1 "选择编号"
+  if [[ -z "${arr[$pick]:-}" ]]; then echo "无效编号" >&2; return 1; fi
+  echo "${arr[$pick]}"
+  return 0
+}
+
+tui_live_list() {
+  local ans
+  while :; do
+    printf '\033[2J\033[H'
+    tui_bold "== 监控列表（5s 刷新，q 返回） =="
+    cmd_status
+    printf '\n(q 返回) '
+    if read -r -t 5 -n 1 ans; then
+      [[ "$ans" == "q" ]] && break
+    fi
+  done
+  echo
+  return 0
+}
+
+tui_add_monitor() {
+  echo; tui_bold "== 添加监控 =="
+  echo "扫描运行中的 claude 会话..."
+  local name tty i=1 pick session_name
+  local names=()
+  while IFS=$'\t' read -r name tty; do
+    [[ -z "$name" ]] && continue
+    printf '  %d) %s  (tty %s)\n' "$i" "$name" "$tty"
+    names[$i]="$name"; i=$((i+1))
+  done < <(scan_running_claude_sessions | sort -u)
+  printf '  %d) 手动输入会话名\n' "$i"
+  names[$i]="__manual__"
+  tui_ask pick "$i" "选择"
+  if [[ "${names[$pick]:-}" == "__manual__" ]]; then
+    read -r -p "claude -n 的会话名: " session_name
+  else
+    session_name="${names[$pick]:-}"
+  fi
+  if ! valid_session_name "$session_name"; then
+    echo "会话名只能含 [A-Za-z0-9._-]，已取消"; return 1
+  fi
+  local conf="$MON_DIR/$session_name.conf"
+  if [[ -f "$conf" ]]; then
+    local yn; read -r -p "监控 $session_name 已存在，覆盖? [y/N]: " yn
+    [[ "$yn" == y* ]] || { echo "已取消"; return 0; }
+  fi
+  local message interval dry
+  tui_ask message  "$DEFAULT_MESSAGE"  "注入词"
+  tui_ask interval "$DEFAULT_INTERVAL" "检测间隔（秒）"
+  tui_ask dry      "n"                 "dry_run 模式 [y/n]"
+  [[ "$dry" == y* ]] && dry=1 || dry=0
+  [[ "$interval" =~ ^[0-9]+$ ]] || interval=$DEFAULT_INTERVAL
+  write_monitor_conf "$conf" "$session_name" "$message" "$interval" 1 "$dry"
+  echo "已写入 ${conf}（daemon 在跑则下一 tick 自动生效）"
+  return 0
+}
+
+tui_edit_monitor() {
+  echo; tui_bold "== 编辑 / 删除监控 =="
+  local name; name=$(tui_pick_monitor) || return 0
+  local conf="$MON_DIR/$name.conf"
+  load_monitor_conf "$conf" || { echo "conf 无效"; return 1; }
+  echo "回车 = 保留当前值"
+  local v sn msg itv en dr
+  tui_ask v "$M_SESSION_NAME" "session_name"; sn="$v"
+  tui_ask v "$M_MESSAGE"     "注入词";         msg="$v"
+  tui_ask v "$M_INTERVAL"    "间隔（秒）";     itv="$v"
+  tui_ask v "$M_ENABLED"     "enabled(1/0)";   en="$v"
+  tui_ask v "$M_DRY_RUN"     "dry_run(1/0)";   dr="$v"
+  [[ "$itv" =~ ^[0-9]+$ ]] || itv=$DEFAULT_INTERVAL
+  [[ "$en" == "1" ]] || en=0
+  [[ "$dr" == "1" ]] || dr=0
+  if ! valid_session_name "$sn"; then echo "会话名非法，保留原名"; sn="$M_SESSION_NAME"; fi
+  write_monitor_conf "$conf" "$sn" "$msg" "$itv" "$en" "$dr"
+  echo "已更新 $conf"
+  local yn; read -r -p "是否删除该监控? [y/N]: " yn
+  if [[ "$yn" == y* ]]; then
+    rm -f "$conf" "$STATE_DIR/$sn.state"
+    echo "已删除"
+  fi
+  return 0
+}
+
+tui_daemon_menu() {
+  echo
+  local p; p=$(daemon_pid)
+  if [[ -n "$p" ]]; then echo "daemon: 运行中 (pid $p)"; else echo "daemon: 未运行"; fi
+  echo "  1) 启动  2) 停止  3) 安装 launchd 常驻  4) 卸载 launchd  5) 返回"
+  local c; read -r -p "选择: " c
+  case "$c" in
+    1) cmd_start ;;
+    2) cmd_stop ;;
+    3) cmd_install ;;
+    4) cmd_uninstall ;;
+  esac
+  return 0
+}
+
+tui_show_logs() {
+  echo
+  if [[ ! -f "$LOG_FILE" ]]; then echo "暂无日志"; return 0; fi
+  tail -n 30 "$LOG_FILE"
+  echo
+  printf '\033[2m（完整日志：%s）\033[0m\n' "$LOG_FILE"
+  return 0
+}
+
+tui_main() {
+  ensure_dirs
+  trap 'echo; exit 130' INT
+  local choice
+  while :; do
+    printf '\033[2J\033[H'
+    tui_bold "== claude-keepalive v$VERSION =="
+    echo "  1) 监控列表（实时刷新）"
+    echo "  2) 添加监控"
+    echo "  3) 编辑 / 删除监控"
+    echo "  4) 启动 / 停止 daemon"
+    echo "  5) 查看日志尾部"
+    echo "  6) 退出"
+    read -r -p "选择: " choice
+    case "$choice" in
+      1) tui_live_list ;;
+      2) tui_add_monitor ;;
+      3) tui_edit_monitor ;;
+      4) tui_daemon_menu ;;
+       5) tui_show_logs ;;
+      6) break ;;
+    esac
+  done
+  echo
   return 0
 }
 

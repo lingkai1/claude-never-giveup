@@ -182,6 +182,20 @@ echo '999999999' > "$PID_FILE"
 daemon_pid | grep -q . && bad "死 pid 不算运行" || ok "死 pid 不算运行"
 rm -f "$PID_FILE"
 
+# ===== Task9 补充: ps 无匹配 → 名字扫描兜底 =====
+iterm_read_contents()    { REPLY_CONTENTS="$STUB_CONTENTS"; return 0; }
+iterm_write_text()       { STUB_WROTE="$2"; return 0; }
+iterm_scan_tty_by_name() { SCAN_COUNT=1; SCAN_LIST="/dev/ttys777"; return 0; }
+find_claude_tty_for_session() { return 1; }
+write_monitor_conf "$MON_DIR/pipe2.conf" pipe2 "继续" 60 1 0
+STUB_CONTENTS='❯'
+STUB_WROTE=""
+check_monitor pipe2
+eq "ps未命中→名字扫描兜底注入" "$STUB_WROTE" "继续"
+read_state pipe2
+eq "兜底路径状态" "$ST_LAST_STATE" "IDLE"
+unset -f iterm_read_contents iterm_write_text iterm_scan_tty_by_name find_claude_tty_for_session
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 rm -rf "$KEEPALIVE_BASE_DIR"
