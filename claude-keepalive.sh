@@ -413,7 +413,7 @@ daemon_run() {
   trap daemon_exit INT TERM
   trap 'rm -f "$PID_FILE"' EXIT
   log INFO daemon "启动（pid $$，tick=${TICK_SECONDS}s）"
-  local conf name
+  local conf name slept
   while :; do
     [[ -e "$STOP_FILE" ]] && { log INFO daemon "检测到 stop 文件，退出"; exit 0; }
     for conf in "$MON_DIR"/*.conf; do
@@ -430,7 +430,13 @@ daemon_run() {
         log ERROR "$name" "conf 无效：$conf"
       fi
     done
-    sleep "$TICK_SECONDS"
+    # 1 秒切片睡眠：TERM 信号与 stop 文件的响应延迟不超过 1s
+    slept=0
+    while (( slept < TICK_SECONDS )); do
+      [[ -e "$STOP_FILE" ]] && { log INFO daemon "检测到 stop 文件，退出"; exit 0; }
+      sleep 1
+      slept=$((slept + 1))
+    done
   done
 }
 
@@ -498,6 +504,55 @@ cmd_once() {
     check_monitor "$name"
   done
   (( any == 0 )) && echo "没有监控配置：$MON_DIR 下放 .conf，或运行 setup"
+  return 0
+}
+
+# ---------- 12. launchd ----------
+launchd_loaded() { launchctl list 2>/dev/null | grep -q "$LAUNCHD_LABEL"; }
+
+cmd_install() {
+  ensure_dirs
+  # launchd 进程无 ~/Desktop 等 TCC 目录的访问权，部署一份到家目录再由 plist 指向它
+  local deploy_dir="$BASE_DIR/bin"
+  local deploy="$deploy_dir/claude-keepalive.sh"
+  mkdir -p "$deploy_dir"
+  cp -f "$SCRIPT_PATH" "$deploy" && chmod +x "$deploy"
+  mkdir -p "$HOME/Library/LaunchAgents"
+  cat > "$LAUNCHD_PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LAUNCHD_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>$deploy</string>
+    <string>daemon</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key>
+  <dict><key>SuccessfulExit</key><false/></dict>
+  <key>StandardOutPath</key><string>$DAEMON_OUT</string>
+  <key>StandardErrorPath</key><string>$DAEMON_OUT</string>
+</dict>
+</plist>
+EOF
+  launchctl bootout "gui/$(id -u)/$LAUNCHD_LABEL" 2>/dev/null
+  if launchctl bootstrap "gui/$(id -u)" "$LAUNCHD_PLIST" 2>/dev/null || launchctl load -w "$LAUNCHD_PLIST" 2>/dev/null; then
+    echo "已安装并加载 LaunchAgent：$LAUNCHD_PLIST"
+    echo "脚本已部署到 ${deploy}（改主脚本后需重跑 install）"
+  else
+    echo "plist 已写入但加载失败，请手动执行：launchctl load $LAUNCHD_PLIST"
+  fi
+  return 0
+}
+
+cmd_uninstall() {
+  launchctl bootout "gui/$(id -u)/$LAUNCHD_LABEL" 2>/dev/null
+  launchctl unload -w "$LAUNCHD_PLIST" 2>/dev/null
+  rm -f "$LAUNCHD_PLIST"
+  echo "已卸载 LaunchAgent"
   return 0
 }
 
