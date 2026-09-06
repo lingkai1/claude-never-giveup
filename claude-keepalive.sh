@@ -65,6 +65,66 @@ log() { # log <LEVEL> <monitor> <message...>
   printf '[%s] [%s] [%s] %s\n' "$(ts)" "$level" "$mon" "$*" >> "$LOG_FILE"
 }
 
+# ---------- 4. 配置 ----------
+valid_session_name() { [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]]; }
+
+load_global_conf() {
+  [[ -f "$CONF_FILE" ]]     && . "$CONF_FILE"
+  [[ -f "$PATTERNS_FILE" ]] && . "$PATTERNS_FILE"
+  return 0
+}
+
+# load_monitor_conf <path> — rc 0 成功；设置 M_* 五个变量
+load_monitor_conf() {
+  local path="$1" kv k v
+  M_SESSION_NAME=""; M_MESSAGE="$DEFAULT_MESSAGE"; M_INTERVAL=$DEFAULT_INTERVAL
+  M_ENABLED=1; M_DRY_RUN=0
+  [[ -f "$path" ]] || return 1
+  while IFS= read -r kv; do
+    [[ -z "$kv" || "$kv" == \#* ]] && continue
+    k="${kv%%=*}"; v="${kv#*=}"
+    case "$k" in
+      session_name) M_SESSION_NAME="$v" ;;
+      message)      M_MESSAGE="$v" ;;
+      interval)     [[ "$v" =~ ^[0-9]+$ ]] && M_INTERVAL=$v ;;
+      enabled)      [[ "$v" == "0" ]] && M_ENABLED=0 || M_ENABLED=1 ;;
+      dry_run)      [[ "$v" == "1" ]] && M_DRY_RUN=1 || M_DRY_RUN=0 ;;
+    esac
+  done < "$path"
+  valid_session_name "$M_SESSION_NAME" || return 1
+  (( M_INTERVAL >= 10 )) || M_INTERVAL=10
+  return 0
+}
+
+write_monitor_conf() { # <path> <session_name> <message> <interval> <enabled> <dry_run>
+  atomic_write "$1" "session_name=$2
+message=$3
+interval=$4
+enabled=$5
+dry_run=$6"
+}
+
+# ---------- 5. 状态 ----------
+state_default() {
+  ST_LAST_STATE="NEVER"; ST_LAST_CHECK=0; ST_LAST_INJECT=0
+  ST_AWAITING=0; ST_CONSEC_FAIL=0
+}
+
+read_state() { # <name>
+  state_default
+  local f="$STATE_DIR/$1.state"
+  [[ -f "$f" ]] && eval "$(grep -E '^ST_[A-Z_]+=' "$f" 2>/dev/null)"
+  return 0
+}
+
+write_state() { # <name>
+  atomic_write "$STATE_DIR/$1.state" "ST_LAST_STATE=$ST_LAST_STATE
+ST_LAST_CHECK=$ST_LAST_CHECK
+ST_LAST_INJECT=$ST_LAST_INJECT
+ST_AWAITING=$ST_AWAITING
+ST_CONSEC_FAIL=$ST_CONSEC_FAIL"
+}
+
 # ---------- 14. 入口 ----------
 if [[ "${KEEPALIVE_TEST_MODE:-}" != "1" && "${BASH_SOURCE[0]}" == "$0" ]]; then
   main "$@"
