@@ -92,6 +92,7 @@ launchd 语义：`KeepAlive.SuccessfulExit=false`——daemon 正常退出（含
 - **一直 NO_SESSION**：会话名对不上 iTerm2 标题。跑 `once` 看日志；确认会话用 `-n` 启动过或 `/rename` 成固定名。
 - **一直 UNKNOWN**：Claude Code UI 改版，idle 签名变了 → 更新 `patterns.conf`。
 - **注入了但没反应**：看 `status` 的 FAILS 列；连续 3 次未生效会自动熔断禁用，去 TUI 重新启用并排查（比如消息词被 Claude Code 过滤）。
+- **落地确认机制**：注入后 90 秒内每 15 秒 peek 一次找 BUSY；正式复查时若终端看不到 marker（后台 agent/任务面板会把消息行挤出可见区），会查该会话的 transcript 文件（`~/.claude/projects/<工作目录映射>/`）做权威确认——委派型会话（主提示符长期空闲、活儿在后台 agent）也能正确判定，不会误熔断。
 
 ## 手动验收清单
 

@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 SCRIPT_PATH = Path(__file__).resolve()
 
 # ---------- 1. 路径与默认值 ----------
