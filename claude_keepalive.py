@@ -658,7 +658,7 @@ def cmd_status() -> int:
             print(f"{name:<18} {'-':<8} CONF_INVALID")
             continue
         st = MonitorState.load(name)
-        print(f"{conf.session_name:<18} {str(conf.enabled):<8} {st.last_state:<15} "
+        print(f"{conf.session_name:<18} {1 if conf.enabled else 0:<8} {st.last_state:<15} "
               f"{_fmt_time(st.last_check):<20} {_fmt_time(st.last_inject):<20} {st.consec_fail}")
     p = daemon_pid()
     print(f"daemon: running (pid {p})" if p else "daemon: stopped")
