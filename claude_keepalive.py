@@ -36,6 +36,7 @@ LAUNCHD_PLIST = Path.home() / "Library" / "LaunchAgents" / (LAUNCHD_LABEL + ".pl
 
 TICK_SECONDS = 15
 BREAKER_LIMIT = 3
+PEEK_WINDOW_SECONDS = 90
 LOG_MAX_BYTES = 5 * 1024 * 1024
 DEFAULT_INTERVAL = 300
 DEFAULT_MESSAGE = "继续"
@@ -149,6 +150,7 @@ class MonitorState:
     last_inject: int = 0
     awaiting: int = 0
     consec_fail: int = 0
+    peek_until: int = 0
 
     @classmethod
     def load(cls, name: str) -> "MonitorState":
@@ -163,6 +165,7 @@ class MonitorState:
             s.last_inject = int(d.get("last_inject", 0))
             s.awaiting = int(d.get("awaiting", 0))
             s.consec_fail = int(d.get("consec_fail", 0))
+            s.peek_until = int(d.get("peek_until", 0))
             return s
         except (OSError, ValueError, TypeError):
             return cls()
@@ -175,6 +178,7 @@ class MonitorState:
             "last_inject": self.last_inject,
             "awaiting": self.awaiting,
             "consec_fail": self.consec_fail,
+            "peek_until": self.peek_until,
         }, ensure_ascii=False, indent=1))
 
     def touch(self, name: str, state: str) -> None:
@@ -231,8 +235,8 @@ def decide_action(awaiting: int, consec: int, content: str, message: str) -> str
     """仅在 classify_tail == IDLE 时调用。"""
     if awaiting == 0:
         return "INJECT_FIRST"
-    tail = "\n".join(strip_ansi(content).splitlines()[-100:])
-    if f"> {message}" in tail:
+    # marker 在整个可见内容里找（提交的消息行可能被任务面板挤出短窗口）
+    if f"> {message}" in strip_ansi(content):
         return "INJECT_AGAIN"
     if consec + 1 >= BREAKER_LIMIT:
         return "TRIP"
@@ -437,17 +441,19 @@ def do_inject(name: str, devtty: str, conf: MonitorConf, st: MonitorState) -> No
         log("INFO", name, f"[dry-run] 本应注入「{conf.message}」")
         st.awaiting = 1
         st.last_inject = now()
+        st.peek_until = now() + PEEK_WINDOW_SECONDS
         return
     rc, err = iterm_write_text(devtty, conf.message)
     if rc == 0:
         st.awaiting = 1
         st.last_inject = now()
+        st.peek_until = now() + PEEK_WINDOW_SECONDS
         log("INFO", name, f"已注入「{conf.message}」")
     else:
         log("ERROR", name, f"注入失败({rc}): {err}")
 
 
-def check_monitor(name: str) -> None:
+def check_monitor(name: str, peek: bool = False) -> None:
     conf_path = MON_DIR / f"{name}.conf"
     conf = MonitorConf.load(conf_path)
     if conf is None:
@@ -503,8 +509,16 @@ def check_monitor(name: str) -> None:
     if state == "BUSY":
         st.awaiting = 0
         st.consec_fail = 0
+        if st.peek_until:
+            log("INFO", name, "peek 窗口内确认注入生效（BUSY），清零计数")
+            st.peek_until = 0
         log("INFO", name, "state=BUSY（注入已生效，计数清零）")
     elif state == "IDLE":
+        if peek:
+            # peek 只找 BUSY；IDLE 不注入不计数，等正式到期检查再判定
+            log("INFO", name, "peek: 仍 IDLE，等待正式检查")
+            st.save(name)
+            return
         decision = decide_action(st.awaiting, st.consec_fail, contents, conf.message)
         if decision in ("INJECT_FIRST", "INJECT_AGAIN"):
             if decision == "INJECT_AGAIN":
@@ -582,6 +596,12 @@ def daemon_run() -> int:
                         check_monitor(name)
                     except Exception as e:  # 单监控异常不中断整体
                         log("ERROR", name, f"检查异常: {e!r}")
+                elif st.peek_until > now():
+                    # 注入后的 peek 窗口：每 tick 快速探测，抓 BUSY 以确认落地
+                    try:
+                        check_monitor(name, peek=True)
+                    except Exception as e:
+                        log("ERROR", name, f"peek 异常: {e!r}")
             # 1 秒切片睡眠：信号与 stop 文件的响应延迟不超过 1s
             deadline = time.time() + TICK_SECONDS
             while time.time() < deadline:

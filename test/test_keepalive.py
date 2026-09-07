@@ -368,6 +368,35 @@ class TestPipeline(KeepaliveBase):
         self.assertEqual(self.stub_wrote, [])
         self.assertEqual(self.ck.MonitorState.load("pipe1").last_state, "NO_ITERM")
 
+    def test_inject_opens_peek_window(self):
+        self._write_conf()
+        self.stub_contents = "❯"
+        self.ck.check_monitor("pipe1")
+        st = self.ck.MonitorState.load("pipe1")
+        self.assertGreater(st.peek_until, self.ck.now())
+
+    def test_peek_busy_confirms_and_clears(self):
+        self._write_conf()
+        self.stub_contents = "❯"
+        self.ck.check_monitor("pipe1")          # 注入，开 peek 窗口
+        self.stub_contents = "⠸ Working (esc to interrupt)"
+        self.ck.check_monitor("pipe1", peek=True)  # peek 抓到 BUSY
+        st = self.ck.MonitorState.load("pipe1")
+        self.assertEqual(st.awaiting, 0)
+        self.assertEqual(st.consec_fail, 0)
+        self.assertEqual(st.peek_until, 0)
+        self.assertEqual(len(self.stub_wrote), 1)   # peek 不再注入
+
+    def test_peek_idle_does_not_inject_or_count(self):
+        self._write_conf()
+        self.stub_contents = "❯"
+        self.ck.check_monitor("pipe1")          # 注入
+        self.ck.check_monitor("pipe1", peek=True)  # peek 时仍 IDLE
+        st = self.ck.MonitorState.load("pipe1")
+        self.assertEqual(st.consec_fail, 0)        # peek 不计数
+        self.assertEqual(len(self.stub_wrote), 1)  # peek 不注入
+        self.assertEqual(st.awaiting, 1)
+
 
 class TestStatusAndDaemonPid(KeepaliveBase):
     def test_status_table_and_dead_pid(self):
