@@ -292,18 +292,23 @@ def extract_session_name_from_args(args: str) -> str:
     return ""
 
 
-def find_claude_tty_for_session(name: str) -> Tuple[Optional[str], int]:
-    """返回 (tty 或 None, 匹配进程数)。count==1 时返回 /dev/ttysN。"""
+def find_claude_tty_for_session(name: str) -> Tuple[Optional[str], int, Optional[int]]:
+    """返回 (tty 或 None, 匹配进程数, pid)。count==1 时返回 /dev/ttysN。"""
     found: Optional[str] = None
     count = 0
+    pid: Optional[int] = None
     for line in ps_claude_lines():
         tty = match_ps_line_for_session(line, name)
         if tty is not None:
             count += 1
             found = tty
+            try:
+                pid = int(line.split(None, 1)[0])
+            except ValueError:
+                pid = None
     if count == 1:
-        return f"/dev/{found}", 1
-    return None, count
+        return f"/dev/{found}", 1, pid
+    return None, count, None
 
 
 def scan_running_claude_sessions() -> List[Tuple[str, str]]:
@@ -316,6 +321,74 @@ def scan_running_claude_sessions() -> List[Tuple[str, str]]:
         if nm and valid_session_name(nm):
             result.append((nm, tty))
     return result
+
+
+# ---------- 5.5 transcript 落地确认（后台 agent 模式下唯一可靠信号） ----------
+def claude_config_dir() -> Path:
+    return Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude"))).expanduser()
+
+
+def proc_cwd(pid: int) -> Optional[str]:
+    try:
+        r = subprocess.run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+                           capture_output=True, text=True, timeout=15)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    for line in r.stdout.splitlines():
+        if line.startswith("n/"):
+            return line[1:]
+    return None
+
+
+def _user_text_of(d: dict) -> str:
+    """取 transcript user 条目的纯文本（排除 tool_result），无则空串。"""
+    msg = d.get("message", {})
+    content = msg.get("content", "") if isinstance(msg, dict) else ""
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = [c.get("text", "") for c in content
+                 if isinstance(c, dict) and c.get("type") == "text"]
+        if parts:
+            return " ".join(parts).strip()
+    return ""
+
+
+def transcript_landed(cwd: str, message: str, since_epoch: int) -> bool:
+    """在 cwd 对应项目的 transcript 里找 since_epoch 之后的文本 user 消息 == message。"""
+    from datetime import datetime
+    munged = re.sub(r"[^A-Za-z0-9]", "-", cwd)
+    proj = claude_config_dir() / "projects" / munged
+    if not proj.is_dir():
+        return False
+    for jf in sorted(proj.glob("*.jsonl"),
+                     key=lambda p: p.stat().st_mtime, reverse=True):
+        try:
+            if jf.stat().st_mtime < since_epoch - 120:
+                continue  # 注入前两分钟就没再写过的文件不可能含它
+            with open(jf, encoding="utf-8", errors="replace") as f:
+                tail = f.readlines()[-300:]
+        except OSError:
+            continue
+        for l in reversed(tail):
+            try:
+                d = json.loads(l)
+            except ValueError:
+                continue
+            if d.get("type") != "user":
+                continue
+            ts = d.get("timestamp", "")
+            if not ts:
+                continue
+            try:
+                t = datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                continue
+            if t <= since_epoch:
+                continue
+            if _user_text_of(d) == message.strip():
+                return True
+    return False
 
 
 # ---------- 6. iTerm2 AppleScript ----------
@@ -463,7 +536,7 @@ def check_monitor(name: str, peek: bool = False) -> None:
         return
     st = MonitorState.load(name)
 
-    tty, count = find_claude_tty_for_session(conf.session_name)
+    tty, count, claude_pid = find_claude_tty_for_session(conf.session_name)
     if count > 1:
         log("ERROR", name, f"多个进程匹配 session_name={conf.session_name}，跳过")
         st.touch(name, "AMBIGUOUS")
@@ -520,6 +593,14 @@ def check_monitor(name: str, peek: bool = False) -> None:
             st.save(name)
             return
         decision = decide_action(st.awaiting, st.consec_fail, contents, conf.message)
+        # 终端 marker 可能被任务面板挤出可见区；transcript 是落地判定的权威信号
+        if (decision in ("INJECT_RETRY", "TRIP") and st.awaiting == 1
+                and claude_pid is not None):
+            cwd = proc_cwd(claude_pid)
+            if cwd and transcript_landed(cwd, conf.message, st.last_inject):
+                log("INFO", name, "transcript 确认上次注入已落地，重置计数")
+                st.consec_fail = 0
+                decision = "INJECT_AGAIN"
         if decision in ("INJECT_FIRST", "INJECT_AGAIN"):
             if decision == "INJECT_AGAIN":
                 st.consec_fail = 0

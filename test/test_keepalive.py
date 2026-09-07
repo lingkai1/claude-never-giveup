@@ -210,18 +210,18 @@ class TestPs(KeepaliveBase):
 
     def test_find_tty_unique(self):
         self.ck.ps_claude_lines = lambda: ["12345 ttys012 claude -n worker"]
-        tty, count = self.ck.find_claude_tty_for_session("worker")
-        self.assertEqual((tty, count), ("/dev/ttys012", 1))
+        tty, count, pid = self.ck.find_claude_tty_for_session("worker")
+        self.assertEqual((tty, count, pid), ("/dev/ttys012", 1, 12345))
 
     def test_find_tty_none(self):
         self.ck.ps_claude_lines = lambda: ["12345 ttys012 claude -n other"]
-        tty, count = self.ck.find_claude_tty_for_session("worker")
-        self.assertEqual((tty, count), (None, 0))
+        tty, count, pid = self.ck.find_claude_tty_for_session("worker")
+        self.assertEqual((tty, count, pid), (None, 0, None))
 
     def test_find_tty_ambiguous(self):
         self.ck.ps_claude_lines = lambda: ["1 ttys001 claude -n worker", "2 ttys002 claude -n worker"]
-        tty, count = self.ck.find_claude_tty_for_session("worker")
-        self.assertEqual((tty, count), (None, 2))
+        tty, count, pid = self.ck.find_claude_tty_for_session("worker")
+        self.assertEqual((tty, count, pid), (None, 2, None))
 
     def test_scan_running_sessions(self):
         self.ck.ps_claude_lines = lambda: [
@@ -261,6 +261,11 @@ class TestPipeline(KeepaliveBase):
                        ck.iterm_scan_tty_by_name, ck.find_claude_tty_for_session)
         ck.MON_DIR.mkdir(parents=True, exist_ok=True)
         ck.STATE_DIR.mkdir(parents=True, exist_ok=True)
+        # 每个用例从干净状态开始（状态文件在用例间会残留）
+        try:
+            (ck.STATE_DIR / "pipe1.json").unlink()
+        except FileNotFoundError:
+            pass
         self.cn = ck.MON_DIR / "pipe1.conf"
         self.stub_tty = "/dev/ttys999"
         self.stub_wrote = []
@@ -280,7 +285,7 @@ class TestPipeline(KeepaliveBase):
         ck.iterm_read_contents = fake_read
         ck.iterm_write_text = fake_write
         ck.iterm_scan_tty_by_name = fake_scan
-        ck.find_claude_tty_for_session = lambda n: (self.stub_tty, 1)
+        ck.find_claude_tty_for_session = lambda n: (self.stub_tty, 1, 4242)
 
     def tearDown(self):
         ck = self.ck
@@ -343,7 +348,7 @@ class TestPipeline(KeepaliveBase):
         self.assertEqual(st.awaiting, 1)  # dry-run 也置 awaiting
 
     def test_ps_miss_title_fallback_injects(self):
-        self.ck.find_claude_tty_for_session = lambda n: (None, 0)
+        self.ck.find_claude_tty_for_session = lambda n: (None, 0, None)
         self.stub_scan = (1, ["/dev/ttys777"])
         self._write_conf()
         self.stub_contents = "❯"
@@ -352,7 +357,7 @@ class TestPipeline(KeepaliveBase):
         self.assertEqual(self.ck.MonitorState.load("pipe1").last_state, "IDLE")
 
     def test_ps_miss_title_ambiguous_skips(self):
-        self.ck.find_claude_tty_for_session = lambda n: (None, 0)
+        self.ck.find_claude_tty_for_session = lambda n: (None, 0, None)
         self.stub_scan = (2, ["/dev/ttys001", "/dev/ttys002"])
         self._write_conf()
         self.stub_contents = "❯"
@@ -396,6 +401,89 @@ class TestPipeline(KeepaliveBase):
         self.assertEqual(st.consec_fail, 0)        # peek 不计数
         self.assertEqual(len(self.stub_wrote), 1)  # peek 不注入
         self.assertEqual(st.awaiting, 1)
+
+    def test_transcript_rescues_retry(self):
+        """marker 不可见但 transcript 证实落地 → 不计数，直接续注。"""
+        self._write_conf()
+        self.stub_contents = "❯"
+        self.ck.check_monitor("pipe1")                       # 首注
+        self.ck.proc_cwd = lambda pid: "/fake/cwd"
+        self.ck.transcript_landed = lambda cwd, msg, since: True
+        self.stub_contents = "无关内容\n❯"                   # marker 不可见
+        self.ck.check_monitor("pipe1")
+        st = self.ck.MonitorState.load("pipe1")
+        self.assertEqual(st.consec_fail, 0)                  # 被挽救，不计数
+        self.assertEqual(len(self.stub_wrote), 2)            # 续注一次
+        self.assertEqual(st.awaiting, 1)
+
+    def test_transcript_absent_still_counts(self):
+        self._write_conf()
+        self.stub_contents = "❯"
+        self.ck.check_monitor("pipe1")
+        self.ck.proc_cwd = lambda pid: "/fake/cwd"
+        self.ck.transcript_landed = lambda cwd, msg, since: False
+        self.stub_contents = "无关内容\n❯"
+        self.ck.check_monitor("pipe1")
+        self.assertEqual(self.ck.MonitorState.load("pipe1").consec_fail, 1)
+
+
+class TestTranscriptLanded(KeepaliveBase):
+    """用假的 CLAUDE_CONFIG_DIR 验证 transcript 落地判定。"""
+
+    def setUp(self):
+        self.cfg = tempfile.mkdtemp(prefix="ck-cfg-")
+        self._old = os.environ.get("CLAUDE_CONFIG_DIR")
+        os.environ["CLAUDE_CONFIG_DIR"] = self.cfg
+        self.proj = Path(self.cfg) / "projects" / "-fake-cwd"
+        self.proj.mkdir(parents=True)
+
+    def tearDown(self):
+        if self._old is None:
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        else:
+            os.environ["CLAUDE_CONFIG_DIR"] = self._old
+        shutil.rmtree(self.cfg, ignore_errors=True)
+
+    def _write_transcript(self, entries):
+        (self.proj / "s.jsonl").write_text(
+            "\n".join(json.dumps(e) for e in entries) + "\n", encoding="utf-8")
+
+    @staticmethod
+    def _user_entry(text, iso_ts):
+        return {"type": "user", "timestamp": iso_ts,
+                "message": {"role": "user", "content": text}}
+
+    def test_landed_after_since(self):
+        from datetime import datetime, timezone
+        now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        now_ep = datetime.now(timezone.utc).timestamp()
+        self._write_transcript([
+            self._user_entry("继续", "2020-01-01T00:00:00.000Z"),
+            self._user_entry("继续", now_iso),
+        ])
+        self.assertTrue(self.ck.transcript_landed("/fake/cwd", "继续", int(now_ep) - 60))
+
+    def test_not_landed_before_since(self):
+        self._write_transcript([
+            self._user_entry("继续", "2020-01-01T00:00:00.000Z"),
+        ])
+        self.assertFalse(self.ck.transcript_landed("/fake/cwd", "继续", 1600000000))
+
+    def test_not_landed_wrong_text(self):
+        from datetime import datetime, timezone
+        now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        self._write_transcript([
+            self._user_entry("别的消息", now_iso),
+        ])
+        self.assertFalse(self.ck.transcript_landed("/fake/cwd", "继续", 1600000000))
+
+    def test_missing_project_dir(self):
+        self.assertFalse(self.ck.transcript_landed("/no/such/cwd", "继续", 0))
+
+    def test_munging(self):
+        self.assertEqual(
+            self.ck.re.sub(r"[^A-Za-z0-9]", "-", "/a/b_c.d"),
+            "-a-b-c-d")
 
 
 class TestStatusAndDaemonPid(KeepaliveBase):
