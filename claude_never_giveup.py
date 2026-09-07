@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# claude-keepalive — 让指定名字的 Claude Code 会话（iTerm2）持续工作
-# 设计文档: docs/specs/2026-09-06-claude-keepalive-design.md（v2 Python 版，见 §14 修订记录）
+# claude-never-giveup — 让指定名字的 Claude Code 会话（iTerm2）持续工作
+# 设计文档: docs/specs/2026-09-06-claude-never-giveup-design.md（v2 Python 版，见 §14 修订记录）
 # 依赖：macOS 自带 python3（3.9+），stdlib only。
 
 from __future__ import annotations
@@ -22,16 +22,16 @@ VERSION = "2.1.0"
 SCRIPT_PATH = Path(__file__).resolve()
 
 # ---------- 1. 路径与默认值 ----------
-BASE_DIR = Path(os.environ.get("KEEPALIVE_BASE_DIR") or Path.home() / ".claude-keepalive")
+BASE_DIR = Path(os.environ.get("NEVER_GIVEUP_BASE_DIR") or Path.home() / ".claude-never-giveup")
 MON_DIR = BASE_DIR / "monitors"
 STATE_DIR = BASE_DIR / "state"
-LOG_FILE = BASE_DIR / "keepalive.log"
-CONF_FILE = BASE_DIR / "keepalive.conf"
+LOG_FILE = BASE_DIR / "never-giveup.log"
+CONF_FILE = BASE_DIR / "never-giveup.conf"
 PATTERNS_FILE = BASE_DIR / "patterns.conf"
 STOP_FILE = BASE_DIR / "stop"
 PID_FILE = BASE_DIR / "daemon.pid"
 DAEMON_OUT = BASE_DIR / "daemon.out"
-LAUNCHD_LABEL = "com.lingkai.claude-keepalive"
+LAUNCHD_LABEL = "com.lingkai.claude-never-giveup"
 LAUNCHD_PLIST = Path.home() / "Library" / "LaunchAgents" / (LAUNCHD_LABEL + ".plist")
 
 TICK_SECONDS = 15
@@ -189,7 +189,7 @@ class MonitorState:
 
 
 def load_global_conf() -> None:
-    """keepalive.conf（key=value）与 patterns.conf（JSON）覆盖全局默认。"""
+    """never-giveup.conf（key=value）与 patterns.conf（JSON）覆盖全局默认。"""
     global TICK_SECONDS, BREAKER_LIMIT, LOG_MAX_BYTES, BUSY_PATTERNS, DIALOG_PATTERNS
     if CONF_FILE.is_file():
         for raw in CONF_FILE.read_text(encoding="utf-8").splitlines():
@@ -256,7 +256,7 @@ def ps_claude_lines() -> List[str]:
     lines = []
     for l in out.splitlines():
         low = l.lower()
-        if "claude" in low and "keepalive" not in low and "grep" not in low:
+        if "claude" in low and "keepalive" not in low and "giveup" not in low and "grep" not in low:
             lines.append(l)
     return lines
 
@@ -818,7 +818,7 @@ def cmd_install() -> int:
     # launchd 进程无 ~/Desktop 等 TCC 目录的访问权，部署一份到家目录再由 plist 指向它
     deploy_dir = BASE_DIR / "bin"
     deploy_dir.mkdir(parents=True, exist_ok=True)
-    deploy = deploy_dir / "claude_keepalive.py"
+    deploy = deploy_dir / "claude_never_giveup.py"
     shutil.copyfile(SCRIPT_PATH, deploy)
     deploy.chmod(0o755)
     LAUNCHD_PLIST.parent.mkdir(parents=True, exist_ok=True)
@@ -1013,7 +1013,7 @@ def tui_main() -> int:
     ensure_dirs()
     while True:
         print("\033[2J\033[H", end="")
-        print(f"\033[1m== claude-keepalive v{VERSION} ==\033[0m")
+        print(f"\033[1m== claude-never-giveup v{VERSION} ==\033[0m")
         print("  1) 监控列表（实时刷新）")
         print("  2) 添加监控")
         print("  3) 编辑 / 删除监控")
@@ -1037,9 +1037,9 @@ def tui_main() -> int:
 
 
 # ---------- 12. 入口 ----------
-USAGE = f"""claude-keepalive v{VERSION} — 让指定名字的 Claude Code 会话（iTerm2）持续工作
+USAGE = f"""claude-never-giveup v{VERSION} — 让指定名字的 Claude Code 会话（iTerm2）持续工作
 
-用法: claude_keepalive.py <命令>
+用法: claude_never_giveup.py <命令>
   setup        TUI：添加/编辑监控、启停 daemon、看日志
   start        启动 daemon（清除 stop 文件）
   stop         停止 daemon（放置 stop 文件）

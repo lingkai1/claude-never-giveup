@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""claude_keepalive 单元测试（unittest，stdlib-only，Python 3.9+）。
+"""claude_never_giveup 单元测试（unittest，stdlib-only，Python 3.9+）。
 
-通过 KEEPALIVE_BASE_DIR + importlib.reload 隔离运行时目录。
+通过 NEVER_GIVEUP_BASE_DIR + importlib.reload 隔离运行时目录。
 运行：/usr/bin/python3 -m unittest discover -s test -v
 """
 import importlib
@@ -24,14 +24,14 @@ class KeepaliveBase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.mkdtemp(prefix="ck-py-test-")
-        os.environ["KEEPALIVE_BASE_DIR"] = cls.tmp
-        import claude_keepalive as ck
+        os.environ["NEVER_GIVEUP_BASE_DIR"] = cls.tmp
+        import claude_never_giveup as ck
         cls.ck = importlib.reload(ck)
 
     @classmethod
     def tearDownClass(cls):
         shutil.rmtree(cls.tmp, ignore_errors=True)
-        os.environ.pop("KEEPALIVE_BASE_DIR", None)
+        os.environ.pop("NEVER_GIVEUP_BASE_DIR", None)
 
 
 class TestHelpers(KeepaliveBase):
