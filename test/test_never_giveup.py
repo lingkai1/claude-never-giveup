@@ -548,5 +548,35 @@ class TestStatusAndDaemonPid(KeepaliveBase):
         self.assertIsNone(ck.daemon_pid())
 
 
+class TestTuiHelpers(KeepaliveBase):
+    def test_disp_width(self):
+        self.assertEqual(self.ck._disp_width("abc"), 3)
+        self.assertEqual(self.ck._disp_width("中文"), 4)
+        self.assertEqual(self.ck._disp_width("a中b"), 4)
+        # ANSI 色码不计宽
+        self.assertEqual(self.ck._disp_width("\x1b[32m中文\x1b[0m"), 4)
+
+    def test_pad_visible_width(self):
+        self.assertEqual(self.ck._pad("中", 4), "中  ")
+        self.assertEqual(self.ck._pad("abcd", 2), "abcd")  # 超宽不截断
+
+    def test_box_aligned(self):
+        box = self.ck._box("标题", ["中文abc", "plain", self.ck._c("彩色", self.ck._C_OK)])
+        lines = box.splitlines()
+        self.assertTrue(lines[0].startswith("╭──"))
+        self.assertTrue(lines[-1].startswith("╰"))
+        # 所有行可见宽度一致（面板对齐）
+        widths = {self.ck._disp_width(l) for l in lines}
+        self.assertEqual(len(widths), 1)
+        # 标题在顶边框里
+        self.assertIn("标题", self.ck._SGR_RE.sub("", lines[0]))
+
+    def test_state_badge_has_color(self):
+        badge = self.ck._state_badge("IDLE")
+        self.assertIn("IDLE", badge)
+        self.assertIn(self.ck._C_OK, badge)
+        self.assertIn(self.ck._C_RESET, badge)
+
+
 if __name__ == "__main__":
     unittest.main()

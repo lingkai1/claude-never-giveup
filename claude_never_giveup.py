@@ -14,11 +14,12 @@ import signal
 import subprocess
 import sys
 import time
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 SCRIPT_PATH = Path(__file__).resolve()
 
 # ---------- 1. 路径与默认值 ----------
@@ -37,6 +38,7 @@ LAUNCHD_PLIST = Path.home() / "Library" / "LaunchAgents" / (LAUNCHD_LABEL + ".pl
 TICK_SECONDS = 15
 BREAKER_LIMIT = 3
 PEEK_WINDOW_SECONDS = 90
+GRACE_ROUNDS = 2   # 注入后观察到非 IDLE 状态（消息可能在队列），宽限的复查轮数
 LOG_MAX_BYTES = 5 * 1024 * 1024
 DEFAULT_INTERVAL = 300
 DEFAULT_MESSAGE = "继续"
@@ -151,6 +153,7 @@ class MonitorState:
     awaiting: int = 0
     consec_fail: int = 0
     peek_until: int = 0
+    grace: int = 0
 
     @classmethod
     def load(cls, name: str) -> "MonitorState":
@@ -166,6 +169,7 @@ class MonitorState:
             s.awaiting = int(d.get("awaiting", 0))
             s.consec_fail = int(d.get("consec_fail", 0))
             s.peek_until = int(d.get("peek_until", 0))
+            s.grace = int(d.get("grace", 0))
             return s
         except (OSError, ValueError, TypeError):
             return cls()
@@ -179,6 +183,7 @@ class MonitorState:
             "awaiting": self.awaiting,
             "consec_fail": self.consec_fail,
             "peek_until": self.peek_until,
+            "grace": self.grace,
         }, ensure_ascii=False, indent=1))
 
     def touch(self, name: str, state: str) -> None:
@@ -523,17 +528,19 @@ def _locate_by_title(name: str, session_name: str) -> Tuple[Optional[str], Optio
 
 
 def do_inject(name: str, devtty: str, conf: MonitorConf, st: MonitorState) -> None:
-    if conf.dry_run:
-        log("INFO", name, f"[dry-run] 本应注入「{conf.message}」")
+    def _mark_injected() -> None:
         st.awaiting = 1
         st.last_inject = now()
         st.peek_until = now() + PEEK_WINDOW_SECONDS
+        st.grace = 0
+
+    if conf.dry_run:
+        log("INFO", name, f"[dry-run] 本应注入「{conf.message}」")
+        _mark_injected()
         return
     rc, err = iterm_write_text(devtty, conf.message)
     if rc == 0:
-        st.awaiting = 1
-        st.last_inject = now()
-        st.peek_until = now() + PEEK_WINDOW_SECONDS
+        _mark_injected()
         log("INFO", name, f"已注入「{conf.message}」")
     else:
         log("ERROR", name, f"注入失败({rc}): {err}")
@@ -596,9 +603,14 @@ def check_monitor(name: str, peek: bool = False) -> None:
     st.last_check = now()
     st.last_state = state
 
+    if st.awaiting == 1 and state != "IDLE":
+        # 注入后出现非 IDLE（处理中/队列/弹窗）：消息可能尚未消化，刷新宽限
+        st.grace = GRACE_ROUNDS
+
     if state == "BUSY":
         st.awaiting = 0
         st.consec_fail = 0
+        st.grace = 0
         if st.peek_until:
             log("INFO", name, "peek 窗口内确认注入生效（BUSY），清零计数")
             st.peek_until = 0
@@ -609,6 +621,13 @@ def check_monitor(name: str, peek: bool = False) -> None:
             log("INFO", name, "peek: 仍 IDLE，等待正式检查")
             st.save(name)
             return
+        if st.awaiting == 1 and st.grace > 0:
+            # 注入后见过非 IDLE（可能排队中），本轮等待：不注入、不计数
+            st.grace -= 1
+            log("INFO", name,
+                f"上次注入后出现过非 IDLE 状态，可能仍在队列，等待消化（宽限余 {st.grace}）")
+            st.save(name)
+            return
         decision = decide_action(st.awaiting, st.consec_fail, contents, conf.message)
         # 终端 marker 可能被任务面板挤出可见区；transcript 是落地判定的权威信号
         if (decision in ("INJECT_RETRY", "TRIP") and st.awaiting == 1
@@ -617,6 +636,7 @@ def check_monitor(name: str, peek: bool = False) -> None:
             if cwd and transcript_landed(cwd, conf.message, st.last_inject):
                 log("INFO", name, "transcript 确认上次注入已落地，重置计数")
                 st.consec_fail = 0
+                st.grace = 0
                 decision = "INJECT_AGAIN"
         if decision in ("INJECT_FIRST", "INJECT_AGAIN"):
             if decision == "INJECT_AGAIN":
@@ -773,19 +793,28 @@ def _fmt_time(epoch: int) -> str:
     return time.strftime("%m-%d %H:%M:%S", time.localtime(epoch)) if epoch > 0 else "-"
 
 
-def cmd_status() -> int:
-    ensure_dirs()
-    print(f"{'NAME':<18} {'ENABLED':<8} {'STATE':<15} {'LAST_CHECK':<20} {'LAST_INJECT':<20} FAILS")
+def _status_rows() -> Tuple[List[Tuple[str, ...]], Optional[int]]:
+    """状态表数据：(name, on, state, last_check, last_inject, fails) 行 + daemon pid。"""
+    rows = []
     for conf_file in sorted(MON_DIR.glob("*.conf")):
         name = conf_file.stem
         conf = MonitorConf.load(conf_file)
         if conf is None:
-            print(f"{name:<18} {'-':<8} CONF_INVALID")
+            rows.append((name, "-", "CONF_INVALID", "-", "-", "-"))
             continue
         st = MonitorState.load(name)
-        print(f"{conf.session_name:<18} {1 if conf.enabled else 0:<8} {st.last_state:<15} "
-              f"{_fmt_time(st.last_check):<20} {_fmt_time(st.last_inject):<20} {st.consec_fail}")
-    p = daemon_pid()
+        rows.append((conf.session_name, "1" if conf.enabled else "0", st.last_state,
+                     _fmt_time(st.last_check), _fmt_time(st.last_inject),
+                     str(st.consec_fail)))
+    return rows, daemon_pid()
+
+
+def cmd_status() -> int:
+    ensure_dirs()
+    rows, p = _status_rows()
+    print(f"{'NAME':<18} {'ENABLED':<8} {'STATE':<15} {'LAST_CHECK':<20} {'LAST_INJECT':<20} FAILS")
+    for r in rows:
+        print(f"{r[0]:<18} {r[1]:<8} {r[2]:<15} {r[3]:<20} {r[4]:<20} {r[5]}")
     print(f"daemon: running (pid {p})" if p else "daemon: stopped")
     return 0
 
@@ -869,9 +898,91 @@ def cmd_uninstall() -> int:
 
 
 # ---------- 11. TUI ----------
+# --- 视觉 helpers（stdlib + ANSI，中文按东亚宽度对齐） ---
+_C_RESET = "\033[0m"
+_C_BOLD = "\033[1m"
+_C_TITLE = "\033[1;36m"
+_C_NUM = "\033[1;33m"
+_C_HINT = "\033[90m"
+_C_OK = "\033[32m"
+_C_WARN = "\033[33m"
+_C_ERR = "\033[31m"
+_C_BUSY = "\033[36m"
+_SGR_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _c(text: str, color: str) -> str:
+    return f"{color}{text}{_C_RESET}"
+
+
+def _disp_width(s: str) -> int:
+    """可见宽度：忽略 ANSI 色码，全角字符按 2 计。"""
+    plain = _SGR_RE.sub("", s)
+    return sum(2 if unicodedata.east_asian_width(ch) in ("F", "W") else 1
+               for ch in plain)
+
+
+def _pad(s: str, width: int) -> str:
+    return s + " " * max(0, width - _disp_width(s))
+
+
+def _box(title: str, lines: List[str]) -> str:
+    """带边框的面板；lines 可含 ANSI 色码，按可见宽度对齐。"""
+    w = max([_disp_width(l) for l in lines] + [_disp_width(title)] + [24])
+    out = ["╭── " + _c(title, _C_TITLE) + " " + "─" * max(1, w - _disp_width(title)) + "╮"]
+    for l in lines:
+        out.append("│  " + _pad(l, w) + "  │")
+    out.append("╰" + "─" * (w + 4) + "╯")
+    return "\n".join(out)
+
+
+def _clear() -> None:
+    print("\033[2J\033[H", end="")
+
+
+_STATE_COLORS = {
+    "IDLE": _C_OK, "BUSY": _C_BUSY, "DIALOG": _C_WARN, "UNKNOWN": _C_HINT,
+    "NEVER": _C_HINT, "NO_SESSION": _C_ERR, "AMBIGUOUS": _C_ERR,
+    "NO_ITERM": _C_ERR, "SESSION_NOT_FOUND": _C_ERR, "CONF_INVALID": _C_ERR,
+}
+
+
+def _state_badge(state: str) -> str:
+    return _c(f"● {state}", _STATE_COLORS.get(state, _C_RESET))
+
+
+def _daemon_badge(pid: Optional[int]) -> str:
+    if pid:
+        return _c(f"● 运行中 (pid {pid})", _C_OK)
+    return _c("○ 未运行", _C_HINT)
+
+
+def _render_monitor_table() -> List[str]:
+    """状态表行（含色码），供 TUI 面板使用。"""
+    rows, p = _status_rows()
+    if not rows:
+        return [_c("（暂无监控配置，选 2 添加）", _C_HINT), "", f"daemon: {_daemon_badge(p)}"]
+    headers = ("NAME", "ON", "STATE", "LAST_CHECK", "LAST_INJECT", "FAIL")
+    cols = list(zip(*rows))
+    widths = [max([_disp_width(h)] + [_disp_width(v) for v in col])
+              for h, col in zip(headers, cols)]
+    hdr = "  ".join(_pad(h, w) for h, w in zip(headers, widths))
+    lines = [_c(hdr, _C_BOLD), _c("─" * _disp_width(hdr), _C_HINT)]
+    for r in rows:
+        cells = []
+        for i, v in enumerate(r):
+            if i == 2:  # STATE 列上色（先按可见宽度补齐再上色，保持对齐）
+                cells.append(_c(_pad(v, widths[i]), _STATE_COLORS.get(v, _C_RESET)))
+            else:
+                cells.append(_pad(v, widths[i]))
+        lines.append("  ".join(cells))
+    lines += ["", f"daemon: {_daemon_badge(p)}"]
+    return lines
+
+
 def _ask(prompt: str, default: str) -> str:
     try:
-        ans = input(f"{prompt} [{default}]: ").strip()
+        ans = input(f"{prompt} {_c(f'[{default}]', _C_HINT)}: ").strip()
     except EOFError:
         ans = ""
     return ans or default
@@ -880,54 +991,59 @@ def _ask(prompt: str, default: str) -> str:
 def tui_pick_monitor() -> Optional[str]:
     confs = sorted(MON_DIR.glob("*.conf"))
     if not confs:
-        print("（暂无监控配置）")
+        print(_c("（暂无监控配置，先选 2 添加）", _C_HINT))
         return None
-    for i, p in enumerate(confs, 1):
-        print(f"  {i}) {p.stem}")
+    lines = [f"{_c(str(i), _C_NUM)})  {p.stem}" for i, p in enumerate(confs, 1)]
+    print(_box("选择监控", lines))
+    print()
     pick = _ask("选择编号", "1")
     if not pick.isdigit() or not (1 <= int(pick) <= len(confs)):
-        print("无效编号")
+        print(_c("无效编号", _C_ERR))
         return None
     return confs[int(pick) - 1].stem
 
 
 def tui_live_list() -> None:
     while True:
-        print("\033[2J\033[H", end="")
-        print("\033[1m== 监控列表（5s 刷新，q+回车 返回） ==\033[0m")
-        cmd_status()
-        print("\n(q 返回)")
+        _clear()
+        print(_box("监控列表 · 5s 刷新", _render_monitor_table()))
+        print()
+        print(_c("  (q + 回车 返回，直接回车立即刷新)", _C_HINT))
         try:
             r, _, _ = select.select([sys.stdin], [], [], 5.0)
         except (OSError, ValueError):
             time.sleep(5)
             continue
         if r:
-            line = sys.stdin.readline().strip().lower()
-            if line == "q":
+            if sys.stdin.readline().strip().lower() == "q":
                 break
 
 
 def tui_add_monitor() -> None:
-    print()
-    print("\033[1m== 添加监控 ==\033[0m")
-    print("扫描运行中的 claude 会话...")
+    _clear()
     sessions = sorted(set(scan_running_claude_sessions()))
     names: List[Optional[str]] = []
+    lines = []
+    if not sessions:
+        lines.append(_c("未扫到 claude -n 命名会话；手动输入即可", _C_HINT))
+        lines.append(_c("（填 iTerm2 标签上显示的会话名，如 aidoc-bugfix）", _C_HINT))
+        lines.append("")
     for nm, tty in sessions:
-        print(f"  {len(names) + 1}) {nm}  (tty {tty})")
+        lines.append(f"{_c(str(len(names) + 1), _C_NUM)})  {nm}   {_c(f'tty {tty}', _C_HINT)}")
         names.append(nm)
-    print(f"  {len(names) + 1}) 手动输入会话名")
+    lines.append(f"{_c(str(len(names) + 1), _C_NUM)})  手动输入会话名")
     names.append(None)
-    pick = _ask("选择", str(len(names)))
+    print(_box("添加监控 · 选择要监控的会话", lines))
+    print()
+    pick = _ask("选择编号", str(len(names)))
     if not pick.isdigit() or not (1 <= int(pick) <= len(names)):
-        print("无效选择")
+        print(_c("无效选择", _C_ERR))
         return
     chosen = names[int(pick) - 1]
     if chosen is None:
-        chosen = input("claude -n 的会话名: ").strip()
+        chosen = input("claude -n 的会话名（即 iTerm2 标签名）: ").strip()
     if not valid_session_name(chosen):
-        print("会话名只能含 [A-Za-z0-9._-]，已取消")
+        print(_c("会话名只能含 [A-Za-z0-9._-]，已取消", _C_ERR))
         return
     conf_path = MON_DIR / f"{chosen}.conf"
     if conf_path.exists():
@@ -935,38 +1051,31 @@ def tui_add_monitor() -> None:
         if not yn.lower().startswith("y"):
             print("已取消")
             return
-    message = _ask("注入词", DEFAULT_MESSAGE)
-    interval = _ask("检测间隔（秒）", str(DEFAULT_INTERVAL))
-    dry = _ask("dry_run 模式 [y/n]", "n")
+    print()
+    message = _ask(_pad("注入词", 16), DEFAULT_MESSAGE)
+    interval = _ask(_pad("检测间隔（秒）", 16), str(DEFAULT_INTERVAL))
+    dry = _ask(_pad("dry_run 模式", 16), "n")
     if not interval.isdigit():
         interval = str(DEFAULT_INTERVAL)
-    conf = MonitorConf(
-        session_name=chosen, message=message, interval=int(interval),
-        enabled=True, dry_run=dry.lower().startswith("y"),
-    )
+    conf = MonitorConf(session_name=chosen, message=message, interval=int(interval),
+                       enabled=True, dry_run=dry.lower().startswith("y"))
     conf.save(conf_path)
-    print(f"已写入 {conf_path}（daemon 在跑则下一 tick 自动生效）")
-
-
-def tui_edit_monitor() -> None:
     print()
-    print("\033[1m== 编辑 / 删除监控 ==\033[0m")
-    name = tui_pick_monitor()
-    if not name:
-        return
-    conf_path = MON_DIR / f"{name}.conf"
-    conf = MonitorConf.load(conf_path)
-    if conf is None:
-        print("conf 无效")
-        return
-    print("回车 = 保留当前值")
-    sn = _ask("session_name", conf.session_name)
-    msg = _ask("注入词", conf.message)
-    itv = _ask("间隔（秒）", str(conf.interval))
-    en = _ask("enabled(1/0)", "1" if conf.enabled else "0")
-    dr = _ask("dry_run(1/0)", "1" if conf.dry_run else "0")
+    print(_c(f"✓ 已写入 {conf_path}", _C_OK))
+    print(_c("  daemon 在跑则 15 秒内自动生效", _C_HINT))
+
+
+def _edit_monitor_fields(conf: MonitorConf, conf_path: Path) -> None:
+    """逐项重问，回车保留当前值。"""
+    print()
+    print(_c("逐项修改，回车 = 保留当前值", _C_HINT))
+    sn = _ask(_pad("session_name", 16), conf.session_name)
+    msg = _ask(_pad("注入词", 16), conf.message)
+    itv = _ask(_pad("间隔（秒）", 16), str(conf.interval))
+    en = _ask(_pad("enabled(1/0)", 16), "1" if conf.enabled else "0")
+    dr = _ask(_pad("dry_run(1/0)", 16), "1" if conf.dry_run else "0")
     if not sn or not valid_session_name(sn):
-        print("会话名非法，保留原名")
+        print(_c("会话名非法，保留原名", _C_WARN))
         sn = conf.session_name
     conf.session_name = sn
     conf.message = msg
@@ -974,20 +1083,79 @@ def tui_edit_monitor() -> None:
     conf.enabled = en == "1"
     conf.dry_run = dr == "1"
     conf.save(conf_path)
-    print(f"已更新 {conf_path}")
-    yn = _ask("是否删除该监控? [y/N]", "n")
-    if yn.lower().startswith("y"):
-        conf_path.unlink(missing_ok=True)
-        (STATE_DIR / f"{sn}.json").unlink(missing_ok=True)
-        print("已删除")
+    print(_c(f"✓ 已更新 {conf_path}", _C_OK))
+
+
+def tui_manage_monitor() -> None:
+    """监控管理子菜单：编辑 / 启停 / 删除一级可达。"""
+    _clear()
+    name = tui_pick_monitor()
+    if not name:
+        return
+    conf_path = MON_DIR / f"{name}.conf"
+    conf = MonitorConf.load(conf_path)
+    if conf is None:
+        print(_c("conf 无效", _C_ERR))
+        return
+    while True:
+        conf = MonitorConf.load(conf_path) or conf
+        st = MonitorState.load(name)
+        _clear()
+        print(_box(f"监控 · {name}", [
+            f"会话: {conf.session_name}    注入词: {conf.message}",
+            f"间隔: {conf.interval}s    dry_run: {'开' if conf.dry_run else '关'}    "
+            f"失败计数: {st.consec_fail}",
+            "",
+            f"{_c('1', _C_NUM)})  编辑配置（逐项重问）",
+            f"{_c('2', _C_NUM)})  {'禁用' if conf.enabled else '启用'}该监控"
+            + ("" if conf.enabled else "   " + _c("（当前已禁用，注入暂停）", _C_HINT)),
+            f"{_c('3', _C_NUM)})  删除该监控",
+            "",
+            f"{_c('q', _C_NUM)})  返回上级",
+        ]))
+        print()
+        if conf.enabled:
+            print(f"  状态: {_state_badge(st.last_state)}    "
+                  f"{'✓ 注入中' if conf.enabled else ''}")
+        else:
+            print(f"  状态: {_state_badge(st.last_state)}    {_c('已禁用', _C_ERR)}")
+        print()
+        c2 = _ask("选择", "q")
+        if c2 == "1":
+            _edit_monitor_fields(conf, conf_path)
+        elif c2 == "2":
+            conf.enabled = not conf.enabled
+            conf.save(conf_path)
+            print(_c(f"✓ 已{'启用' if conf.enabled else '禁用'} {name}",
+                     _C_OK if conf.enabled else _C_WARN))
+        elif c2 == "3":
+            yn = _ask(f"确认删除监控 {name}（配置+状态，不影响会话本身）? [y/N]", "n")
+            if yn.lower().startswith("y"):
+                conf_path.unlink(missing_ok=True)
+                (STATE_DIR / f"{conf.session_name}.json").unlink(missing_ok=True)
+                print(_c(f"✓ 已删除 {name}", _C_ERR))
+                return
+            print("已取消")
+        elif c2.lower() == "q":
+            return
 
 
 def tui_daemon_menu() -> None:
-    print()
+    _clear()
     p = daemon_pid()
-    print(f"daemon: 运行中 (pid {p})" if p else "daemon: 未运行")
-    print("  1) 启动  2) 停止  3) 安装 launchd 常驻  4) 卸载 launchd  5) 返回")
-    c = _ask("选择", "5")
+    ld = "已装" if launchd_loaded() else "未装"
+    print(_box("daemon 控制", [
+        f"daemon: {_daemon_badge(p)}    launchd 常驻: {ld}",
+        "",
+        f"{_c('1', _C_NUM)})  启动",
+        f"{_c('2', _C_NUM)})  停止",
+        f"{_c('3', _C_NUM)})  安装 launchd 常驻（开机自启）",
+        f"{_c('4', _C_NUM)})  卸载 launchd",
+        "",
+        f"{_c('q', _C_NUM)})  返回上级",
+    ]))
+    print()
+    c = _ask("选择", "q")
     if c == "1":
         cmd_start()
     elif c == "2":
@@ -999,39 +1167,44 @@ def tui_daemon_menu() -> None:
 
 
 def tui_show_logs() -> None:
-    print()
+    _clear()
     if not LOG_FILE.is_file():
-        print("暂无日志")
+        print(_c("暂无日志", _C_HINT))
         return
-    lines = LOG_FILE.read_text(encoding="utf-8").splitlines()
-    for l in lines[-30:]:
-        print(l)
-    print(f"\033[2m（完整日志：{LOG_FILE}）\033[0m")
+    lines = LOG_FILE.read_text(encoding="utf-8").splitlines()[-30:]
+    print(_box(f"日志尾部 · 最近 {len(lines)} 行", [_c(l[:110], _C_HINT) for l in lines]))
+    print()
+    print(f"（完整日志：{LOG_FILE}）")
 
 
 def tui_main() -> int:
     ensure_dirs()
     while True:
-        print("\033[2J\033[H", end="")
-        print(f"\033[1m== claude-never-giveup v{VERSION} ==\033[0m")
-        print("  1) 监控列表（实时刷新）")
-        print("  2) 添加监控")
-        print("  3) 编辑 / 删除监控")
-        print("  4) 启动 / 停止 daemon")
-        print("  5) 查看日志尾部")
-        print("  6) 退出")
-        choice = _ask("选择", "6")
+        _clear()
+        print(_box(f"claude-never-giveup v{VERSION}", [
+            f"daemon: {_daemon_badge(daemon_pid())}",
+            "",
+            f"{_c('1', _C_NUM)})  监控列表（实时刷新）",
+            f"{_c('2', _C_NUM)})  添加监控",
+            f"{_c('3', _C_NUM)})  编辑 / 启停 / 删除监控",
+            f"{_c('4', _C_NUM)})  daemon 控制（启动 / 停止 / launchd）",
+            f"{_c('5', _C_NUM)})  查看日志尾部",
+            "",
+            f"{_c('q', _C_NUM)})  退出",
+        ]))
+        print()
+        choice = _ask("选择", "q")
         if choice == "1":
             tui_live_list()
         elif choice == "2":
             tui_add_monitor()
         elif choice == "3":
-            tui_edit_monitor()
+            tui_manage_monitor()
         elif choice == "4":
             tui_daemon_menu()
         elif choice == "5":
             tui_show_logs()
-        elif choice == "6":
+        elif choice.lower() in ("q", "6"):
             break
     return 0
 
