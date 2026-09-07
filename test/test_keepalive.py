@@ -145,6 +145,22 @@ class TestClassify(KeepaliveBase):
     def test_ansi_wrapped_prompt(self):
         self.assertEqual(self.ck.classify_tail("\x1b[32m❯\x1b[0m\n"), "IDLE")
 
+    def test_idle_with_tall_footer(self):
+        """实况复刻：状态栏换行 2 行 + auto-update 提示，❯ 之后有 8 行内容。"""
+        fix = (
+            "   … +7 completed \n"
+            "                                    ✘ Auto-update failed · R\n"
+            "──────────────────────────────────────\n"
+            "❯\xa0 \n"
+            "──────────────────────────────────────\n"
+            "  [gpt-6-astra[1m]] ██░░░░ 29% | relay-claw git:(main) | aidoc-bugfix |\n"
+            "  ⏱️   38h 57m | Ship it. ⚡ \n"
+            "  ──────────────────────────────\n"
+            "  ✓ Bash ×10 | ✓ TaskOutput ×6 | ✓ Read ×2 | ✓ Agent ×1 \n"
+            "  ⏵⏵ bypass permissions on · 1 shell · ← for agents \n"
+        )
+        self.assertEqual(self.ck.classify_tail(fix), "IDLE")
+
 
 class TestDecide(KeepaliveBase):
     def test_inject_first(self):

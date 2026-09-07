@@ -220,13 +220,14 @@ def classify_tail(text: str) -> str:
     lines = strip_ansi(text).splitlines()[-40:]
     tail12 = lines[-12:]
     tail8 = tail12[-8:]
-    nonempty = [l for l in tail12 if l.strip()]
-    last6 = nonempty[-6:]
     if any(re.search(p, "\n".join(tail8)) for p in BUSY_PATTERNS):
         return "BUSY"
     if any(re.search(p, "\n".join(tail12)) for p in DIALOG_PATTERNS):
         return "DIALOG"
-    if any(l.strip() == "❯" for l in last6):
+    # 输入框 ❯ 之下还可能有可变高度的 footer（状态栏多行、auto-update 提示、
+    # 分隔线等），在末 20 行的非空行里找整行恰为 ❯ 的输入框（实测 footer 可达 8 行）
+    nonempty20 = [l for l in lines[-20:] if l.strip()]
+    if any(l.strip() == "❯" for l in nonempty20[-12:]):
         return "IDLE"
     return "UNKNOWN"
 
