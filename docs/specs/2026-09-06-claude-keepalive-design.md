@@ -169,3 +169,13 @@ install / uninstall   # 生成/移除 LaunchAgent plist 并加载/卸载
 - 只处理「正常停止」；进程崩溃、限流横幅、断流不在本工具职责内。
 - 会话完成一轮与下一轮注入之间最长空转一个 interval（默认 5 分钟，可调小）。
 - 「永不停止」会持续消耗额度；熔断、dry_run、stop 文件、按监控禁用是四层刹车。
+
+## 14. 修订记录
+
+**2026-09-07：实现语言改为 Python（stdlib-only，v2.0.0）**，替代 bash v1.0.0。行为规格（§3-§8、§10-§13）不变，仅以下实现细节调整：
+
+- 运行时：macOS 自带 `/usr/bin/python3`（3.9+），仍零外部依赖；launchd plist 以 `/usr/bin/python3` 调部署副本。
+- state 文件改为 JSON（`state/<名字>.json`），不再使用 shell key=value + eval。
+- `patterns.conf` 改为 JSON：`{"BUSY_PATTERNS": [...], "DIALOG_PATTERNS": [...]}`。
+- osascript 调用增加 30 秒超时保护。
+- 定位链路补充：ps 参数匹配是主链路；**未用 `-n` 启动的会话靠 iTerm2 会话标题兜底**（Claude Code 将会话名写入终端标题，`/rename` 后同步）——实测用户环境所有会话均无 `-n`，兜底链路为事实主路径。
