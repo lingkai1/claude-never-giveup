@@ -250,6 +250,14 @@ class TestPs(KeepaliveBase):
         self.assertIn(("ppt", "ttys003"), sessions)
         self.assertEqual(len(sessions), 2)
 
+    def test_find_pid_by_tty(self):
+        self.ck.ps_claude_lines = lambda: [
+            "1 ttys001 claude --settings x.json",
+            "2 ttys002 node /x/cli.js -n other",
+        ]
+        self.assertEqual(self.ck.find_claude_pid_by_tty("/dev/ttys001"), 1)
+        self.assertIsNone(self.ck.find_claude_pid_by_tty("/dev/ttys003"))
+
 
 class TestLoadGlobalConf(KeepaliveBase):
     def test_global_conf_and_patterns_json(self):
@@ -441,6 +449,22 @@ class TestPipeline(KeepaliveBase):
         self.stub_contents = "无关内容\n❯"
         self.ck.check_monitor("pipe1")
         self.assertEqual(self.ck.MonitorState.load("pipe1").consec_fail, 1)
+
+    def test_title_fallback_pid_backfill_rescues(self):
+        """标题兜底定位（ps 无匹配）也能经 tty 反查 pid 走 transcript 挽救。"""
+        self._write_conf()
+        self.ck.find_claude_tty_for_session = lambda n: (None, 0, None)
+        self.stub_scan = (1, ["/dev/ttys777"])
+        self.stub_contents = "❯"
+        self.ck.check_monitor("pipe1")                       # 兜底注入
+        self.ck.find_claude_pid_by_tty = lambda t: 4242
+        self.ck.proc_cwd = lambda pid: "/fake/cwd"
+        self.ck.transcript_landed = lambda cwd, msg, since: True
+        self.stub_contents = "无关内容\n❯"
+        self.ck.check_monitor("pipe1")
+        st = self.ck.MonitorState.load("pipe1")
+        self.assertEqual(st.consec_fail, 0)
+        self.assertEqual(len(self.stub_wrote), 2)
 
 
 class TestTranscriptLanded(KeepaliveBase):

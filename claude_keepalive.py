@@ -312,6 +312,18 @@ def find_claude_tty_for_session(name: str) -> Tuple[Optional[str], int, Optional
     return None, count, None
 
 
+def find_claude_pid_by_tty(devtty: str) -> Optional[int]:
+    """按 tty 反查 claude 进程 PID（标题兜底定位路径下也能拿到 pid 用于 transcript 确认）。"""
+    want = devtty.removeprefix("/dev/")
+    for line in ps_claude_lines():
+        if ps_tty_of_line(line) == want:
+            try:
+                return int(line.split(None, 1)[0])
+            except ValueError:
+                return None
+    return None
+
+
 def scan_running_claude_sessions() -> List[Tuple[str, str]]:
     result = []
     for line in ps_claude_lines():
@@ -576,6 +588,10 @@ def check_monitor(name: str, peek: bool = False) -> None:
         else:
             devtty = tty
 
+    # 标题兜底路径拿不到 pid，这里按 tty 反查补上（transcript 确认需要）
+    if claude_pid is None:
+        claude_pid = find_claude_pid_by_tty(devtty)
+
     state = classify_tail(contents)
     st.last_check = now()
     st.last_state = state
@@ -738,6 +754,13 @@ def cmd_stop() -> int:
     if p:
         try:
             os.kill(p, signal.SIGTERM)
+            # 等 daemon 真正退出（避免紧跟着的 start 误判「已在运行」）
+            for _ in range(50):
+                try:
+                    os.kill(p, 0)
+                    time.sleep(0.1)
+                except OSError:
+                    break
             print(f"已通知 daemon (pid {p}) 退出")
         except OSError:
             print("daemon 未在运行（stop 文件已放置）")
