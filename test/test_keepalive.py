@@ -252,5 +252,144 @@ class TestLoadGlobalConf(KeepaliveBase):
             self.ck.BREAKER_LIMIT = 3
 
 
+class TestPipeline(KeepaliveBase):
+    """stub 外部依赖，验证 check_monitor 决策路径与熔断写回。"""
+
+    def setUp(self):
+        ck = self.ck
+        self._saved = (ck.iterm_read_contents, ck.iterm_write_text,
+                       ck.iterm_scan_tty_by_name, ck.find_claude_tty_for_session)
+        ck.MON_DIR.mkdir(parents=True, exist_ok=True)
+        ck.STATE_DIR.mkdir(parents=True, exist_ok=True)
+        self.cn = ck.MON_DIR / "pipe1.conf"
+        self.stub_tty = "/dev/ttys999"
+        self.stub_wrote = []
+        self.stub_contents = ""
+        self.stub_scan = (0, [])
+
+        def fake_read(tty):
+            return 0, self.stub_contents
+
+        def fake_write(tty, msg):
+            self.stub_wrote.append(msg)
+            return 0, ""
+
+        def fake_scan(name):
+            return True, self.stub_scan
+
+        ck.iterm_read_contents = fake_read
+        ck.iterm_write_text = fake_write
+        ck.iterm_scan_tty_by_name = fake_scan
+        ck.find_claude_tty_for_session = lambda n: (self.stub_tty, 1)
+
+    def tearDown(self):
+        ck = self.ck
+        (ck.iterm_read_contents, ck.iterm_write_text,
+         ck.iterm_scan_tty_by_name, ck.find_claude_tty_for_session) = self._saved
+
+    def _write_conf(self, enabled=True, dry_run=False):
+        self.ck.MonitorConf(session_name="pipe1", message="继续", interval=60,
+                            enabled=enabled, dry_run=dry_run).save(self.cn)
+
+    def test_idle_first_inject(self):
+        self._write_conf()
+        self.stub_contents = "> 继续\n完成\n❯"
+        self.ck.check_monitor("pipe1")
+        self.assertEqual(self.stub_wrote, ["继续"])
+        st = self.ck.MonitorState.load("pipe1")
+        self.assertEqual(st.awaiting, 1)
+        self.assertEqual(st.last_state, "IDLE")
+
+    def test_landed_resets_fail(self):
+        self._write_conf()
+        self.stub_contents = "> 继续\n❯"
+        self.ck.check_monitor("pipe1")
+        self.ck.check_monitor("pipe1")  # INJECT_AGAIN 路径
+        self.assertEqual(self.ck.MonitorState.load("pipe1").consec_fail, 0)
+
+    def test_breaker_trips_and_writes_back(self):
+        self._write_conf()
+        self.stub_contents = "无关内容\n❯"
+        for _ in range(4):  # 首注(INJECT_FIRST) + 3 次未落地 → TRIP
+            self.ck.check_monitor("pipe1")
+        st = self.ck.MonitorState.load("pipe1")
+        self.assertEqual(st.consec_fail, 3)
+        conf = self.ck.MonitorConf.load(self.cn)
+        self.assertFalse(conf.enabled)
+        # TRIP 那次不注入：4 次检查只有前 3 次注入
+        self.assertEqual(len(self.stub_wrote), 3)
+
+    def test_busy_resets_counters(self):
+        self._write_conf()
+        self.stub_contents = "⠸ Working (esc to interrupt)\n"
+        self.ck.check_monitor("pipe1")
+        st = self.ck.MonitorState.load("pipe1")
+        self.assertEqual(st.last_state, "BUSY")
+        self.assertEqual(st.awaiting, 0)
+        self.assertEqual(self.stub_wrote, [])
+
+    def test_disabled_skips(self):
+        self._write_conf(enabled=False)
+        self.stub_contents = "❯"
+        self.ck.check_monitor("pipe1")
+        self.assertEqual(self.stub_wrote, [])
+
+    def test_dry_run_no_inject(self):
+        self._write_conf(dry_run=True)
+        self.stub_contents = "❯"
+        self.ck.check_monitor("pipe1")
+        self.assertEqual(self.stub_wrote, [])
+        st = self.ck.MonitorState.load("pipe1")
+        self.assertEqual(st.awaiting, 1)  # dry-run 也置 awaiting
+
+    def test_ps_miss_title_fallback_injects(self):
+        self.ck.find_claude_tty_for_session = lambda n: (None, 0)
+        self.stub_scan = (1, ["/dev/ttys777"])
+        self._write_conf()
+        self.stub_contents = "❯"
+        self.ck.check_monitor("pipe1")
+        self.assertEqual(self.stub_wrote, ["继续"])
+        self.assertEqual(self.ck.MonitorState.load("pipe1").last_state, "IDLE")
+
+    def test_ps_miss_title_ambiguous_skips(self):
+        self.ck.find_claude_tty_for_session = lambda n: (None, 0)
+        self.stub_scan = (2, ["/dev/ttys001", "/dev/ttys002"])
+        self._write_conf()
+        self.stub_contents = "❯"
+        self.ck.check_monitor("pipe1")
+        self.assertEqual(self.stub_wrote, [])
+        self.assertEqual(self.ck.MonitorState.load("pipe1").last_state, "AMBIGUOUS")
+
+    def test_read_error_sets_no_iterm(self):
+        self.ck.iterm_read_contents = lambda tty: (2, "execution error: ... (-1743)")
+        self._write_conf()
+        self.stub_contents = "❯"
+        self.ck.check_monitor("pipe1")
+        self.assertEqual(self.stub_wrote, [])
+        self.assertEqual(self.ck.MonitorState.load("pipe1").last_state, "NO_ITERM")
+
+
+class TestStatusAndDaemonPid(KeepaliveBase):
+    def test_status_table_and_dead_pid(self):
+        ck = self.ck
+        ck.MON_DIR.mkdir(parents=True, exist_ok=True)
+        ck.MonitorConf(session_name="s7", message="继续", interval=60,
+                       enabled=True, dry_run=False).save(ck.MON_DIR / "s7.conf")
+        st = ck.MonitorState(last_state="IDLE", last_check=ck.now())
+        st.save("s7")
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            ck.cmd_status()
+        out = buf.getvalue()
+        self.assertIn("s7", out)
+        self.assertIn("daemon: stopped", out)
+        # 死 pid 不算运行
+        ck.PID_FILE.write_text("999999999")
+        self.assertIsNone(ck.daemon_pid())
+        # pid 文件缺失
+        ck.PID_FILE.unlink()
+        self.assertIsNone(ck.daemon_pid())
+
+
 if __name__ == "__main__":
     unittest.main()
